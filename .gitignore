@@ -1,0 +1,10 @@
+.claude/
+.venv*/
+*.csv
+*.pdf
+.DS_Store
+*.docx
+*.txt
+__pycache__
+.env
+*.zip

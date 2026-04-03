@@ -1,0 +1,80 @@
+'''
+Chapter 10 -- LLMs
+
+- Conditional generation
+    - Generaating text based on a prompt
+    - Many practical NLP tasks can be cast as word prediction
+    - Usually autoregressive generation / causal generation
+    - Decoding = process that takes place for next word prediction
+        - Most 'likely' next word = greedy decoding 
+            - Words are predictable and the response repetitive (sometimes called deterministic)
+            - This is not actually really used
+        - Sampling
+            - Many different methods/flavors of sampling
+- Sampling
+    - Random sampling
+        - As it sounds. Randomly select a word.
+        - The portion of rare words can be significant, hence, decent chance a rare ('bad') word is selected
+            - Not really used since 'bad' words could be selected so often
+                - if vocab of 30k and 5 likely words, that means 30k-5/30k chance to pick a 'bad' word
+    - Top k sampling
+        - Generalization of greedy decoding
+            - Sort by probability, take top k words, renormalize, then randomly select w.r.t. the normalized proba
+                - selected word is 'likely' enough
+            - what happens when k=1?
+                - full on greedy decoding
+    - Top p sampling
+        - Define p as the probability to get choices to add up to
+            - If p = 0.5, then take the top n words that their proba adds up to 0.5
+                - Then same process. Renormalize, and randomly select from renormalized list
+    - Temperature sampling
+        - Don't truncate the list, just reshape it
+- Pre-trained Large Language Models
+    - Self-supervision == The next word is the label
+        - Teacher forcing...
+            - When predicting the next word, predict it, then when moving on to the next next word, teacher forcing means the model always
+            sees the TRUE word history rather than using its predicted word
+                - Ensures the model is learning from the actual real token sequence rather than it's predicted token sequence 
+    - Need a training corpus
+        - Requires lots of ML methods for data cleaning 
+    - Issues
+        - Copyright material
+        - Data consent
+        - Privacy 
+- Finetuning
+    - Process of taking a trained model and continue training on a new collection of information - perhaps specialty areas
+    - DoxGPT - pre-trained with finetuning for medical 
+        - pre-trained with foundational models - learns grammar, reasoning, patterns, general word and language knowledge
+        - followed by RLHF to provide guardrails and 'fine tune' it for medical knowledge and use
+    - Finetuning strategies
+        - continued pre-training
+            - training continues with all model parameters subject to change
+                - very slow and very expensive
+        - PEFT (parameter-efficient finetuning)
+            - Freeze a lot of parameters - but allow some to change
+        - New Head Training
+            - Will discuss in Ch. 11
+                - Freeze the entire foundational model
+                    - Add an additional 'head' or 'layer' on top of the rest of the model
+        - SFT (Supervised Fine Tuning)
+- Evaluating LLMs
+    - Perplexity
+    - Size
+    - How long it takes to train
+    - Memory requirements?
+    - Energy consumption 
+    - Fairness - Bias, stereotypes, etc.,
+    - Leaderboards even
+        - Dynabench, human benchmarks (coding, reasoning, mathematics, etc)
+- Scaling laws
+    - Power scaling
+    - Quadratic compute cost scaling
+- Potential LLM Harms
+    - Hallucinations
+    - Toxic Language
+    - Misinformation
+    - Now have Model Cards
+        - Sort of an SDS (Safety datasheet) or nutrition label for LLMs
+            - In theory, makes them more transparent, accountable, and safe
+            - Info about how the model should/should not be used
+'''
