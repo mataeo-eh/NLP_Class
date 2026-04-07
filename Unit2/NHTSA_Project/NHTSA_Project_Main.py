@@ -4,10 +4,15 @@ from pathlib import Path
 import os
 import litellm
 import argparse
+import re
 from litellm import completion
 from dotenv import load_dotenv
 
-from Prompts import Specific_Subsystem_Prompt, Safety_Prompt
+from Prompts import Safety_Prompt, get_available_prompts, get_prompt_display_name
+from Project_Tools.Random_Sampling import (
+    get_random_sample_rows,
+    get_sequential_rows,
+)
 
 
 
@@ -77,7 +82,8 @@ except KeyError:
 # To regenerate the Parquet after a data refresh:
 #   python3 NHTSA/Build_DF.py
 # ---------------------------------------------------------------------------
-file_path = Path("NHTSA/complaints_cleaned.parquet")
+PROJECT_ROOT = Path(__file__).resolve().parent
+file_path = PROJECT_ROOT / "NHTSA" / "complaints_cleaned.parquet"
 
 
 def load_df():
@@ -207,7 +213,139 @@ def print_LLM_response(content, finish_reason, prompt_tokens, completion_tok, to
     print(f"Completion tok: {completion_tok}")
     print(f"Total tokens  : {total_tokens}")
 
-from Project_Tools.Store_LLM_Responses import process_and_store_response
+from Project_Tools.Store_LLM_Responses import (
+    get_processed_df_indices,
+    process_and_store_response,
+)
+
+
+def resolve_num_samples(samples_arg, random_sampling=False):
+    if samples_arg is None:
+        return 10
+
+    normalized_value = samples_arg.strip().lower()
+
+    if normalized_value in ["all", "none"]:
+        if random_sampling:
+            raise ValueError("--random-sampling requires --samples to be an integer.")
+        return None
+
+    try:
+        num_samples = int(samples_arg)
+    except ValueError:
+        raise ValueError(
+            f"Invalid --samples value: '{samples_arg}'. "
+            "Use a non-negative integer, 'All', or 'None'."
+        )
+
+    if num_samples < 0:
+        raise ValueError("--samples must be a non-negative integer.")
+
+    return num_samples
+
+
+def get_complaint_column(df):
+    for column_name in ["CDESCR", "complaint", "Complaint", "COMPLAINT"]:
+        if column_name in df.columns:
+            return column_name
+
+    if len(df.columns) > 19:
+        return df.columns[19]
+
+    raise KeyError("Could not determine the complaint text column in the dataset.")
+
+
+def normalize_prompt_selector(value):
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def parse_prompt_selection(selection_text, available_prompts):
+    if not selection_text:
+        raise ValueError("Prompt selection was not provided.")
+
+    raw_selectors = [value.strip() for value in selection_text.split(",")]
+    if any(not value for value in raw_selectors):
+        raise ValueError("Invalid prompt selection. Use comma-separated prompt numbers or names.")
+
+    prompt_lookup = {}
+    for idx, prompt_func in enumerate(available_prompts, start=1):
+        display_name = get_prompt_display_name(prompt_func)
+        selector_values = {
+            str(idx),
+            normalize_prompt_selector(prompt_func.__name__),
+            normalize_prompt_selector(display_name),
+        }
+
+        if prompt_func.__name__.endswith("_Prompt"):
+            selector_values.add(normalize_prompt_selector(prompt_func.__name__[:-7]))
+
+        for selector_value in selector_values:
+            prompt_lookup[selector_value] = prompt_func
+
+    selected_prompt_functions = []
+    seen_prompt_names = set()
+
+    for raw_selector in raw_selectors:
+        selector_key = normalize_prompt_selector(raw_selector)
+        prompt_func = prompt_lookup.get(selector_key)
+        if prompt_func is None:
+            raise ValueError(
+                f"Invalid prompt selection: '{raw_selector}'. "
+                "Choose from the numbered prompt list or prompt names."
+            )
+
+        if prompt_func.__name__ in seen_prompt_names:
+            continue
+
+        seen_prompt_names.add(prompt_func.__name__)
+        selected_prompt_functions.append(prompt_func)
+
+    if not selected_prompt_functions:
+        raise ValueError("Please select at least one prompt.")
+
+    return selected_prompt_functions
+
+
+def select_prompt_functions():
+    available_prompts = get_available_prompts()
+    if not available_prompts:
+        raise ValueError("No prompts are currently defined in Prompts.py.")
+
+    print("Available prompts:")
+    for idx, prompt_func in enumerate(available_prompts, start=1):
+        print(f"{idx}. {get_prompt_display_name(prompt_func)}")
+
+    while True:
+        try:
+            raw_selection = input(
+                "Select prompt number(s) or name(s), separated by commas: "
+            ).strip()
+        except EOFError as exc:
+            raise ValueError("Prompt selection was not provided.") from exc
+
+        if not raw_selection:
+            print("Please enter at least one prompt number or name.")
+            continue
+
+        try:
+            return parse_prompt_selection(raw_selection, available_prompts)
+        except ValueError as exc:
+            print(str(exc))
+
+
+def get_selected_prompt_functions(prompt_selection_enabled, prompt_selectors=None):
+    available_prompts = get_available_prompts()
+    if not available_prompts:
+        raise ValueError("No prompts are currently defined in Prompts.py.")
+
+    if prompt_selectors:
+        return parse_prompt_selection(prompt_selectors, available_prompts)
+
+    if prompt_selection_enabled:
+        return select_prompt_functions()
+
+    return [Safety_Prompt]
+
 
 # ---------------------------------------------------------------------------
 # Argument Parser
@@ -239,9 +377,25 @@ def get_args():
     parser.add_argument(
         "--samples",
         type=str,
-        default="10",
+        default=None,
         required=False,
-        help="Number of samples to process from the NHTSA database. Can be an integer, 'All', or 'None'. Default is 10."
+        help="Number of samples to process from the NHTSA database. Can be an integer, 'All', or 'None'. Defaults to 10 unless --random-sampling is used."
+    )
+    parser.add_argument(
+        "--random-sampling",
+        action="store_true",
+        help="Randomly sample unprocessed complaints without replacement. Requires --samples."
+    )
+    parser.add_argument(
+        "--prompt",
+        action="store_true",
+        help="Interactively choose one or more predefined prompts from Prompts.py."
+    )
+    parser.add_argument(
+        "--prompts",
+        type=str,
+        required=False,
+        help="Comma-separated prompt numbers or names, e.g. '1,2' or 'Safety_Prompt,Specific_Subsystem_Prompt'."
     )
     
     args = parser.parse_args()
@@ -251,6 +405,20 @@ def get_args():
             parser.error("--chart requires --chart-csv.")
         if not args.columns:
             parser.error("--chart requires --columns.")
+
+    if args.random_sampling and args.samples is None:
+        parser.error("--random-sampling requires --samples.")
+
+    if args.prompts:
+        try:
+            parse_prompt_selection(args.prompts, get_available_prompts())
+        except ValueError as exc:
+            parser.error(str(exc))
+
+    try:
+        resolve_num_samples(args.samples, random_sampling=args.random_sampling)
+    except ValueError as exc:
+        parser.error(str(exc))
             
     return args
 
@@ -269,45 +437,105 @@ def main():
     
     df = load_df()
     print(f"Loaded {len(df):,} rows x {len(df.columns)} columns")
-    
-    if args.samples.lower() in ["all", "none"]:
+
+    prompt_functions = get_selected_prompt_functions(args.prompt, args.prompts)
+    complaint_column = get_complaint_column(df)
+
+    print(
+        "Using prompt(s): "
+        + ", ".join(get_prompt_display_name(prompt_func) for prompt_func in prompt_functions)
+    )
+
+    processed_indices_by_prompt = {
+        prompt_func.__name__: get_processed_df_indices(args.output, prompt_func.__name__)
+        for prompt_func in prompt_functions
+    }
+
+    for prompt_func in prompt_functions:
+        processed_count = len(processed_indices_by_prompt[prompt_func.__name__])
+        if processed_count:
+            print(
+                f"Found {processed_count:,} previously processed row(s) in "
+                f"{prompt_func.__name__}.csv"
+            )
+
+    processed_indices = set()
+    for prompt_func in prompt_functions:
+        processed_indices.update(processed_indices_by_prompt[prompt_func.__name__])
+
+    num_samples = resolve_num_samples(
+        args.samples,
+        random_sampling=args.random_sampling,
+    )
+    if num_samples is None:
         num_samples = len(df)
-    else:
-        try:
-            num_samples = int(args.samples)
-        except ValueError:
-            print(f"Invalid --samples value: '{args.samples}'. Defaulting to 10.")
-            num_samples = 10
-            
-    num_samples = min(num_samples, len(df))
-    print(f"Processing {num_samples} sample(s)...")
-    
-    for row_pos in range(num_samples):
-        df_index = df.index[row_pos]
-        complaint = str(df.iloc[row_pos, 19])
-        print(f"\n--- Processing complaint at index {df_index} ({row_pos + 1}/{num_samples}) ---")
-        
-        # Use Safety_Prompt (as an example)
-        prompt_func = Safety_Prompt
-        prompts = prompt_func(complaint)
-        
-        messages = LLM_Message(system_prompt=prompts["system"], user_prompt=prompts["user"])
-        tools = LLM_Tools()
-        
-        # Process and store, passing the Call_LLM function reference and the true df_index
-        parsed_json, raw_content = process_and_store_response(
-            call_llm_func=Call_LLM,
-            messages=messages,
-            tools=tools,
-            df_index=df_index,
-            prompt_func_name=prompt_func.__name__,
-            output_dir=args.output
+
+    if args.random_sampling:
+        rows_to_process = get_random_sample_rows(
+            df=df,
+            n=num_samples,
+            processed_indices=processed_indices,
         )
-        
-        if parsed_json:
-            print(f"Final Parsed Output for {df_index}:", parsed_json)
-        else:
-            print(f"Failed to process complaint at index {df_index}.")
+        print(
+            f"Randomly selected {len(rows_to_process)} unprocessed sample(s) "
+            "without replacement."
+        )
+    else:
+        rows_to_process = get_sequential_rows(
+            df=df,
+            n=num_samples,
+            processed_indices=processed_indices,
+        )
+        print(
+            f"Processing {len(rows_to_process)} sequential unprocessed sample(s)..."
+        )
+
+    if rows_to_process.empty:
+        print("No unprocessed rows available for this prompt.")
+        return
+
+    total_samples = len(rows_to_process)
+
+    for row_pos, (df_index, row) in enumerate(rows_to_process.iterrows(), start=1):
+        complaint = str(row[complaint_column])
+        print(f"\n=== Complaint index {df_index} ({row_pos}/{total_samples}) ===")
+
+        for prompt_func in prompt_functions:
+            if df_index in processed_indices_by_prompt[prompt_func.__name__]:
+                print(
+                    f"Skipping {df_index} for {get_prompt_display_name(prompt_func)} "
+                    "because it is already stored in that task's CSV."
+                )
+                continue
+
+            print(f"Using {get_prompt_display_name(prompt_func)}")
+
+            prompts = prompt_func(complaint)
+            messages = LLM_Message(system_prompt=prompts["system"], user_prompt=prompts["user"])
+            tools = LLM_Tools()
+
+            # Process and store, passing the Call_LLM function reference and the true df_index
+            parsed_json, raw_content = process_and_store_response(
+                call_llm_func=Call_LLM,
+                messages=messages,
+                tools=tools,
+                df_index=df_index,
+                prompt_func_name=prompt_func.__name__,
+                output_dir=args.output
+            )
+
+            if parsed_json:
+                processed_indices_by_prompt[prompt_func.__name__].add(df_index)
+                print(
+                    f"Final Parsed Output for {df_index} "
+                    f"({get_prompt_display_name(prompt_func)}):",
+                    parsed_json,
+                )
+            else:
+                print(
+                    f"Failed to process complaint at index {df_index} "
+                    f"with {get_prompt_display_name(prompt_func)}."
+                )
 
 
 if __name__ == "__main__":
