@@ -1,5 +1,6 @@
 import pandas as pd
 from pathlib import Path
+import inspect
 
 # ---------------------------------------------------------------------------
 # NHTSA Component Taxonomy
@@ -52,6 +53,32 @@ def _load_nhtsa_taxonomy() -> list[str]:
         return []
 
 NHTSA_COMPONENT_TAXONOMY: list[str] = _load_nhtsa_taxonomy()
+
+
+def get_available_prompts():
+    prompt_functions = []
+
+    for obj in globals().values():
+        if not inspect.isfunction(obj):
+            continue
+        if obj.__module__ != __name__:
+            continue
+        if obj.__name__.startswith("_"):
+            continue
+        if not obj.__name__.endswith("_Prompt"):
+            continue
+
+        prompt_functions.append(obj)
+
+    return prompt_functions
+
+
+def get_prompt_display_name(prompt_func):
+    prompt_name = prompt_func.__name__
+    if prompt_name.endswith("_Prompt"):
+        prompt_name = prompt_name[:-7]
+
+    return f"{prompt_name.replace('_', ' ')} Prompt"
 
 
 complaint = None
