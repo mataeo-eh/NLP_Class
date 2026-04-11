@@ -1,5 +1,6 @@
 import pandas as pd
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import os
 import litellm
@@ -151,7 +152,7 @@ def Call_LLM(messages = None, tools = None, on_chunk = None):
     api_base=api_base,
     # The base URL of the endpoint to hit. Required when pointing at a
 
-    temperature=1,
+    temperature=0.2,
     # Controls randomness. Range: 0.0 – 2.0.
     
     max_tokens=8000,
@@ -169,6 +170,12 @@ def Call_LLM(messages = None, tools = None, on_chunk = None):
     # Seconds before LiteLLM raises an APITimeoutError if the provider
     # has not responded. Prevents the script from hanging indefinitely.
     # Catch with: except openai.APITimeoutError.
+
+    num_retries=5,
+    # LiteLLM will automatically retry this call up to 3 times on transient
+    # server-side errors (rate limits, 5xx, timeouts) before raising. This is
+    # the first line of defense; process_and_store_response adds an outer retry
+    # layer on top for errors that exhaust even these attempts.
 
         # ------------------------------------------------------------------
     # DEBUGGING (LiteLLM-specific)
@@ -346,7 +353,10 @@ def get_selected_prompt_functions(prompt_selection_enabled, prompt_selectors=Non
 
     return [Safety_Prompt]
 
-
+'''
+Example CLI usage
+python Unit2/NHTSA_Project/NHTSA_Project_Main.py --samples 100 --random-sampling --prompts Specific_Subsystem_Prompt
+'''
 # ---------------------------------------------------------------------------
 # Argument Parser
 # ---------------------------------------------------------------------------
@@ -377,7 +387,7 @@ def get_args():
     parser.add_argument(
         "--samples",
         type=str,
-        default=None,
+        default=10,
         required=False,
         help="Number of samples to process from the NHTSA database. Can be an integer, 'All', or 'None'. Defaults to 10 unless --random-sampling is used."
     )
@@ -397,7 +407,20 @@ def get_args():
         required=False,
         help="Comma-separated prompt numbers or names, e.g. '1,2' or 'Safety_Prompt,Specific_Subsystem_Prompt'."
     )
-    
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        required=False,
+        help=(
+            "Number of parallel worker threads for LLM calls. "
+            "Each worker makes its own API call concurrently. "
+            "If not provided, all available system workers are used, "
+            "which can cause the system to lag. "
+            "Decrease if you hit API rate limits."
+        )
+    )
+
     args = parser.parse_args()
     
     if args.chart:
@@ -495,12 +518,26 @@ def main():
         return
 
     total_samples = len(rows_to_process)
+    worker_label = args.workers if args.workers is not None else "all available"
+    print(f"Dispatching {total_samples} row(s) across {worker_label} worker thread(s)...")
 
-    for row_pos, (df_index, row) in enumerate(rows_to_process.iterrows(), start=1):
+    def process_one(df_index, row):
+        """
+        Worker function: processes one complaint row for every selected prompt.
+
+        Runs in a thread — all shared state it reads (prompt_functions,
+        processed_indices_by_prompt, complaint_column, args) is either
+        read-only or updated exclusively from the main thread after futures
+        complete, so no additional locking is needed here.
+        """
         complaint = str(row[complaint_column])
-        print(f"\n=== Complaint index {df_index} ({row_pos}/{total_samples}) ===")
+        results = {}  # prompt_func_name -> parsed_json (or None on failure)
+
+        print(f"\n=== Complaint index {df_index} ===")
 
         for prompt_func in prompt_functions:
+            # Redundant safety check — rows_to_process was already pre-filtered,
+            # but this guards against edge cases where a row slips through.
             if df_index in processed_indices_by_prompt[prompt_func.__name__]:
                 print(
                     f"Skipping {df_index} for {get_prompt_display_name(prompt_func)} "
@@ -514,28 +551,66 @@ def main():
             messages = LLM_Message(system_prompt=prompts["system"], user_prompt=prompts["user"])
             tools = LLM_Tools()
 
-            # Process and store, passing the Call_LLM function reference and the true df_index
-            parsed_json, raw_content = process_and_store_response(
+            parsed_json, _ = process_and_store_response(
                 call_llm_func=Call_LLM,
                 messages=messages,
                 tools=tools,
                 df_index=df_index,
                 prompt_func_name=prompt_func.__name__,
-                output_dir=args.output
+                output_dir=args.output,
             )
 
-            if parsed_json:
-                processed_indices_by_prompt[prompt_func.__name__].add(df_index)
+            results[prompt_func.__name__] = parsed_json
+
+        return df_index, results
+
+    # Submit all rows to the thread pool. Each future represents one complaint row.
+    # LLM calls are I/O-bound (network), so threading is the right primitive here —
+    # threads yield the GIL while waiting on the socket, so workers run truly in parallel.
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(process_one, df_index, row): df_index
+            for df_index, row in rows_to_process.iterrows()
+        }
+
+        completed = 0
+        for future in as_completed(futures):
+            completed += 1
+            submitted_index = futures[future]
+
+            try:
+                df_index, results = future.result()
+            except Exception as e:
+                # An unexpected exception (not a handled server error) escaped
+                # process_and_store_response. Log it and continue so one bad row
+                # doesn't abort the entire batch.
                 print(
-                    f"Final Parsed Output for {df_index} "
-                    f"({get_prompt_display_name(prompt_func)}):",
-                    parsed_json,
+                    f"Unexpected error in worker for index {submitted_index}: {e}. "
+                    "Skipping this row."
                 )
-            else:
-                print(
-                    f"Failed to process complaint at index {df_index} "
-                    f"with {get_prompt_display_name(prompt_func)}."
-                )
+                continue
+
+            # Update processed_indices_by_prompt from the main thread only —
+            # avoids any concurrent mutation of the shared sets.
+            for func_name, parsed_json in results.items():
+                if parsed_json:
+                    processed_indices_by_prompt[func_name].add(df_index)
+                    prompt_display = next(
+                        get_prompt_display_name(pf)
+                        for pf in prompt_functions
+                        if pf.__name__ == func_name
+                    )
+                    print(
+                        f"Final Parsed Output for {df_index} ({prompt_display}):",
+                        parsed_json,
+                    )
+                else:
+                    print(
+                        f"Failed to process complaint at index {df_index} "
+                        f"with {func_name}."
+                    )
+
+            print(f"Progress: {completed}/{total_samples} complete")
 
 
 if __name__ == "__main__":

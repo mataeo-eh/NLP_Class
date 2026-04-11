@@ -1,6 +1,7 @@
 .claude/
 .venv*/
 *.csv
+!*Prompt.csv
 *.pdf
 .DS_Store
 *.docx
