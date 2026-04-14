@@ -3,3 +3,6 @@ Create a bar chart of the subsystem complaints
 
 Prepare a short (2-5 slides) PPT to present
     I chose Dynabench
+
+Research RLHF - DPO - and MMLU
+    - Quick research, be ready to do some talking about em
