@@ -355,7 +355,7 @@ def get_selected_prompt_functions(prompt_selection_enabled, prompt_selectors=Non
 
 '''
 Example CLI usage
-python Unit2/NHTSA_Project/NHTSA_Project_Main.py --samples 100 --random-sampling --prompts Specific_Subsystem_Prompt
+python Unit2/NHTSA_Project/NHTSA_Project_Main.py --samples 1000 --random-sampling --prompts Specific_Subsystem_Prompt
 '''
 # ---------------------------------------------------------------------------
 # Argument Parser
