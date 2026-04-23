@@ -1,6 +1,7 @@
 import pandas as pd
 from pathlib import Path
 import inspect
+from pprint import pprint
 
 # ---------------------------------------------------------------------------
 # NHTSA Component Taxonomy
@@ -161,3 +162,6 @@ Assign every label from the taxonomy that applies — do not limit yourself to o
 --- END USER COMPLAINT ---
 '''
     return {"system": system_prompt, "user": user_prompt}
+
+
+pprint(_load_nhtsa_taxonomy())

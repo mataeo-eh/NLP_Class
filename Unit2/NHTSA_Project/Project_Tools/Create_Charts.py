@@ -311,6 +311,10 @@ def compare_LLM_to_NHTSA(csv_path, parquet_path):
     # the LLM completely misses.
     miss_pairs = []          # list of (nhtsa_label: str, llm_label: str)
 
+    # Full-disagreement cases: stored as (df_index, complaint_text) so they can
+    # be printed after the charts for manual inspection.
+    no_agree_cases = []      # list of (df_index: int, cdescr: str)
+
     for _, row in csv_df.iterrows():
         # LLM subsystems are stored as a Python list literal string in the CSV.
         try:
@@ -337,6 +341,9 @@ def compare_LLM_to_NHTSA(csv_path, parquet_path):
                 for n in nhtsa_set:
                     for l in llm_set:
                         miss_pairs.append((n, l))
+                # Store the complaint index, labels, and text for post-chart printing.
+                complaint_text = str(pq_df.loc[row["df_index"], "CDESCR"])
+                no_agree_cases.append((row["df_index"], nhtsa_set, llm_set, complaint_text))
 
         # --- per-label records (subplot 2, from the NHTSA label's perspective) ---
         for nhtsa_label in nhtsa_set:
@@ -524,3 +531,16 @@ def compare_LLM_to_NHTSA(csv_path, parquet_path):
         cbar.ax.tick_params(labelsize=8)
 
     plt.show()
+
+    # --- print full-disagreement complaints --------------------------------
+    # These are cases where the LLM's labels shared zero overlap with the
+    # NHTSA expert labels — worth reviewing manually to understand failure modes.
+    print(f"\n{'='*70}")
+    print(f"FULL DISAGREEMENT CASES  ({len(no_agree_cases)} of {total} complaints)")
+    print(f"{'='*70}\n")
+    for idx, (df_idx, nhtsa_lbls, llm_lbls, text) in enumerate(no_agree_cases, start=1):
+        print(f"[{idx}] Complaint index: {df_idx}")
+        print(f"    Human labels: {', '.join(sorted(nhtsa_lbls))}")
+        print(f"    LLM labels:   {', '.join(sorted(llm_lbls))}")
+        print(f"    {text}")
+        print()
