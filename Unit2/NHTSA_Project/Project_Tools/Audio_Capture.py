@@ -4,8 +4,6 @@ import soundfile as sf
 import threading
 import queue
 import numpy as np
-import sounddevice as sd
-import soundfile as sf
 import torch
 import whisper
 
@@ -18,8 +16,18 @@ WHISPER_BATCH_SECONDS = 3
 OUTPUT_WAV = "recording.wav"
 OUTPUT_TXT = "transcript.txt"
 
-VAD_DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
-WHISPER_DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+
+def get_best_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+VAD_DEVICE = get_best_device()
+WHISPER_DEVICE = get_best_device()
+WHISPER_FP16 = WHISPER_DEVICE == "cuda"
 
 # ---------------------------------------------------------------------------
 # Whisper model size selector
@@ -38,6 +46,24 @@ WHISPER_DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 #   English-only variants are faster and more accurate for English speech.
 # ---------------------------------------------------------------------------
 WHISPER_MODEL = "small.en"
+
+
+def validate_whisper_package() -> None:
+    whisper_path = getattr(whisper, "__file__", "") or ""
+    has_load_model = hasattr(whisper, "load_model")
+
+    if has_load_model:
+        return
+
+    raise ImportError(
+        "Imported the wrong 'whisper' package from "
+        f"{whisper_path or 'an unknown location'}. "
+        "This script requires OpenAI Whisper. "
+        "Run: pip uninstall whisper && pip install openai-whisper"
+    )
+
+
+validate_whisper_package()
 
 # --- Load models ---
 print(f"Loading Silero VAD on {VAD_DEVICE}...")
@@ -121,7 +147,11 @@ def whisper_worker():
             segment = np.array(batch_buffer)
             batch_buffer.clear()
 
-            result = whisper_model.transcribe(segment, fp16=False, language="en")
+            result = whisper_model.transcribe(
+                segment,
+                fp16=WHISPER_FP16,
+                language="en"
+            )
             text = result["text"].strip()
             if text:
                 transcript.append(text)
