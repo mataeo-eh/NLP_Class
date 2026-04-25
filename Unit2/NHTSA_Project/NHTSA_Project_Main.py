@@ -28,7 +28,7 @@ load_dotenv()
 # Environment variable guards
 # ---------------------------------------------------------------------------
 try:
-    api_key = os.environ["LITELLM_API_KEY"]
+    api_key = os.environ["OPENAI_API_KEY"]
 except KeyError:
     raise EnvironmentError(
         "LITELLM_API_KEY is not set. "
@@ -161,6 +161,7 @@ def Call_LLM(messages = None, tools = None, on_chunk = None):
     tools=tools,
     # List of tool/function schemas the model may call. 
 
+
     tool_choice="auto",
     # Controls whether and which tool(s) the model uses.
 
@@ -194,7 +195,8 @@ def Call_LLM(messages = None, tools = None, on_chunk = None):
     prompt_tokens  = 0
     completion_tok = 0
     total_tokens   = 0
-
+    if tools == None:
+        tool_choice=None
     for chunk in response:
         delta = chunk.choices[0].delta
         if delta.content:
