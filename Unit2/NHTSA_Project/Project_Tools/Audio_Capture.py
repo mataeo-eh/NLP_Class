@@ -1,23 +1,48 @@
-import sounddevice as sd
-import soundfile as sf
+"""
+Audio_Capture.py
+----------------
+Importable module that captures microphone input, uses Silero VAD to detect
+end-of-speech, and transcribes the recorded audio with OpenAI Whisper.
 
+Public API
+----------
+capture_and_transcribe() -> str
+    Records the user's spoken input, transcribes it, and returns the plain-text
+    transcript. Nothing is written to disk. Safe to call multiple times — each
+    call creates its own fresh state (queues, events, etc.) while reusing the
+    module-level VAD and Whisper models that were loaded once at import time.
+
+Design notes
+------------
+- VAD (Silero) only decides *when* to stop recording. It does not gate what
+  Whisper receives — all raw audio goes to Whisper so no speech is dropped.
+- Whisper processes audio in rolling batches (WHISPER_BATCH_SECONDS) rather
+  than one giant segment, so transcription latency is lower for long inputs.
+- Models are loaded once at module import time and kept in memory. Cold-start
+  cost is paid the first time this module is imported, not on every call.
+"""
+
+import sounddevice as sd
 import threading
 import queue
 import numpy as np
 import torch
 import whisper
 
-# --- Config ---
-SAMPLE_RATE = 16000
-CHUNK_SAMPLES = 512
-VAD_THRESHOLD = 0.5
-SILENCE_CHUNKS_TO_STOP = 30
-WHISPER_BATCH_SECONDS = 3
-OUTPUT_WAV = "recording.wav"
-OUTPUT_TXT = "transcript.txt"
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SAMPLE_RATE = 16000          # Hz — required by Silero VAD
+CHUNK_SAMPLES = 512          # ~32 ms per chunk at 16 kHz
+VAD_THRESHOLD = 0.5          # Silero speech-probability cutoff
+SILENCE_CHUNKS_TO_STOP = 50  # ~1.6 s of silence triggers stop
+WHISPER_BATCH_SECONDS = 3    # audio batched to Whisper in 3-second segments
 
 
-def get_best_device() -> str:
+def _get_best_device() -> str:
+    """Return the best available torch device (cuda > mps > cpu)."""
     if torch.cuda.is_available():
         return "cuda"
     if torch.backends.mps.is_available():
@@ -25,168 +50,200 @@ def get_best_device() -> str:
     return "cpu"
 
 
-VAD_DEVICE = get_best_device()
-WHISPER_DEVICE = get_best_device()
-WHISPER_FP16 = WHISPER_DEVICE == "cuda"
+_VAD_DEVICE = _get_best_device()
+_WHISPER_DEVICE = _get_best_device()
+
+# fp16 is only supported on CUDA; MPS and CPU must use fp32
+_WHISPER_FP16 = _WHISPER_DEVICE == "cuda"
 
 # ---------------------------------------------------------------------------
 # Whisper model size selector
 #
 # Available models (larger = more accurate but slower to load/run):
-#   "tiny"    — fastest, least accurate (~39 M params)
-#   "base"    — good balance for short phrases (~74 M params)       ← default
-#   "small"   — noticeably better accuracy (~244 M params)
-#   "medium"  — high accuracy, heavier RAM/compute (~769 M params)
-#   "large"   — best accuracy, slowest (~1550 M params)
-#   "large-v2"— updated large with improved accuracy
-#   "large-v3"— latest large, best overall quality
+#   "tiny"     — fastest, least accurate (~39 M params)
+#   "base"     — good balance for short phrases (~74 M params)
+#   "small"    — noticeably better accuracy (~244 M params)      ← default
+#   "medium"   — high accuracy, heavier RAM/compute (~769 M params)
+#   "large-v3" — best overall quality, slowest
 #
-# Multi-lingual vs English-only (English-only models end in ".en"):
+# Append ".en" for English-only variants (faster and more accurate for English):
 #   e.g. "tiny.en", "base.en", "small.en", "medium.en"
-#   English-only variants are faster and more accurate for English speech.
 # ---------------------------------------------------------------------------
-WHISPER_MODEL = "small.en"
+_WHISPER_MODEL_NAME = "small.en"
 
 
-def validate_whisper_package() -> None:
-    whisper_path = getattr(whisper, "__file__", "") or ""
-    has_load_model = hasattr(whisper, "load_model")
-
-    if has_load_model:
+def _validate_whisper_package() -> None:
+    """Raise ImportError if the 'whisper' import resolved to the wrong package."""
+    if hasattr(whisper, "load_model"):
         return
-
     raise ImportError(
-        "Imported the wrong 'whisper' package from "
-        f"{whisper_path or 'an unknown location'}. "
-        "This script requires OpenAI Whisper. "
+        f"Imported the wrong 'whisper' package from "
+        f"{getattr(whisper, '__file__', 'unknown location')}. "
+        "This module requires OpenAI Whisper. "
         "Run: pip uninstall whisper && pip install openai-whisper"
     )
 
 
-validate_whisper_package()
+_validate_whisper_package()
 
-# --- Load models ---
-print(f"Loading Silero VAD on {VAD_DEVICE}...")
-vad_model, _ = torch.hub.load(
-    repo_or_dir='snakers4/silero-vad',
-    model='silero_vad',
-    force_reload=False
+# ---------------------------------------------------------------------------
+# Model loading — happens once at import time, reused across all calls
+# ---------------------------------------------------------------------------
+
+print(f"[Audio_Capture] Loading Silero VAD on {_VAD_DEVICE}...")
+_vad_model, _ = torch.hub.load(
+    repo_or_dir="snakers4/silero-vad",
+    model="silero_vad",
+    force_reload=False,
 )
-vad_model = vad_model.to(VAD_DEVICE)
+_vad_model = _vad_model.to(_VAD_DEVICE)
 
-print(f"Loading Whisper '{WHISPER_MODEL}' on {WHISPER_DEVICE}...")
-whisper_model = whisper.load_model(WHISPER_MODEL, device=WHISPER_DEVICE)
+print(f"[Audio_Capture] Loading Whisper '{_WHISPER_MODEL_NAME}' on {_WHISPER_DEVICE}...")
+# whisper.load_model(..., device="mps") fails because Whisper's model contains
+# a sparse COO buffer (alignment_heads) used only for word-level timestamps.
+# MPS doesn't support sparse tensor ops, so .to("mps") raises NotImplementedError.
+#
+# Fix: load on CPU, then use _apply to move every tensor to MPS individually,
+# skipping any sparse buffers (they stay on CPU where sparse ops are supported).
+# alignment_heads is only accessed when word_timestamps=True — we don't use that,
+# so leaving it on CPU is safe and has no effect on normal transcription.
+_whisper_model = whisper.load_model(_WHISPER_MODEL_NAME, device="cpu")
+if _WHISPER_DEVICE != "cpu":
+    _whisper_model._apply(
+        lambda t: t.to(_WHISPER_DEVICE) if not t.is_sparse else t
+    )
 
-# --- Shared state ---
-# Two separate queues so VAD and Whisper each get every chunk independently.
-vad_queue = queue.Queue()     # audio_callback -> vad_worker (stop logic only)
-whisper_queue = queue.Queue() # audio_callback -> whisper_worker (all audio)
-stop_recording = threading.Event()
 
-all_audio = []  # accumulates everything for the .wav
+# ---------------------------------------------------------------------------
+# Private helper
+# ---------------------------------------------------------------------------
 
-
-def vad_check(chunk: np.ndarray) -> float:
-    tensor = torch.tensor(chunk, dtype=torch.float32).to(VAD_DEVICE)
+def _vad_check(chunk: np.ndarray) -> float:
+    """Return Silero's speech probability (0–1) for a single audio chunk."""
+    tensor = torch.tensor(chunk, dtype=torch.float32).to(_VAD_DEVICE)
     with torch.no_grad():
-        return vad_model(tensor, SAMPLE_RATE).item()
+        return _vad_model(tensor, SAMPLE_RATE).item()
 
 
-def audio_callback(indata, frames, time, status):
-    # Keep this callback as lightweight as possible — heavy work (VAD, Whisper)
-    # runs in separate threads so we never exceed the ~32ms chunk deadline.
-    chunk = indata[:, 0].copy()
-    all_audio.append(chunk)   # always accumulate for .wav
-    vad_queue.put(chunk)      # VAD worker decides when to stop
-    whisper_queue.put(chunk)  # Whisper worker gets everything
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
+def capture_and_transcribe() -> str:
+    """
+    Open the microphone, record until VAD detects end-of-speech, transcribe
+    via Whisper, and return the transcript as a plain string.
 
-def vad_worker():
-    # Only responsible for running VAD and triggering stop_recording when
-    # sustained silence is detected. Does not gate what Whisper receives.
-    silence_count = 0
-    speech_detected = False
+    No audio or transcript is written to disk. The function blocks until
+    speech has been detected and a period of silence follows.
 
-    while not stop_recording.is_set():
-        try:
-            chunk = vad_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
+    Returns
+    -------
+    str
+        The Whisper transcript of the user's spoken input. Returns an empty
+        string if no speech was detected.
+    """
+    # Fresh per-call state — safe to call this function multiple times
+    vad_q: queue.Queue = queue.Queue()
+    whisper_q: queue.Queue = queue.Queue()
+    stop_evt = threading.Event()
+    transcript_result: list[str] = []  # whisper_worker writes the final string here
 
-        is_speech = vad_check(chunk) >= VAD_THRESHOLD
+    # ------------------------------------------------------------------
+    # Audio callback — called on the sounddevice I/O thread every chunk.
+    # Must be as lightweight as possible to avoid missing the ~32ms deadline.
+    # ------------------------------------------------------------------
+    def _audio_callback(indata, _frames, _time, _status):
+        chunk = indata[:, 0].copy()
+        vad_q.put(chunk)     # VAD worker decides when to stop
+        whisper_q.put(chunk) # Whisper worker transcribes everything
 
-        if is_speech:
-            silence_count = 0
-            speech_detected = True
-        elif speech_detected:
-            silence_count += 1
-            if silence_count >= SILENCE_CHUNKS_TO_STOP:
-                stop_recording.set()
+    # ------------------------------------------------------------------
+    # VAD worker — only responsible for detecting end-of-speech and
+    # setting stop_evt. Does not filter what Whisper receives.
+    # ------------------------------------------------------------------
+    def _vad_worker():
+        silence_count = 0
+        speech_detected = False
 
+        while not stop_evt.is_set():
+            try:
+                chunk = vad_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
-def whisper_worker():
-    # Receives all raw audio (not VAD-filtered) and batches it into segments
-    # of WHISPER_BATCH_SECONDS for transcription.
-    transcript = []
-    batch_buffer = []
+            is_speech = _vad_check(chunk) >= VAD_THRESHOLD
 
-    while not (stop_recording.is_set() and whisper_queue.empty()):
-        try:
-            chunk = whisper_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
+            if is_speech:
+                silence_count = 0
+                speech_detected = True
+            elif speech_detected:
+                silence_count += 1
+                if silence_count >= SILENCE_CHUNKS_TO_STOP:
+                    stop_evt.set()
 
-        batch_buffer.extend(chunk)
+    # ------------------------------------------------------------------
+    # Whisper worker — receives all raw audio, batches into segments of
+    # WHISPER_BATCH_SECONDS, transcribes each, then writes the joined
+    # transcript into transcript_result once the queue is fully drained.
+    # ------------------------------------------------------------------
+    def _whisper_worker():
+        transcript: list[str] = []
+        batch_buffer: list[float] = []
 
-        # Send a batch to Whisper once enough audio has accumulated, or flush
-        # whatever remains when recording stops and the queue is drained.
-        batch_ready = len(batch_buffer) >= SAMPLE_RATE * WHISPER_BATCH_SECONDS
-        recording_done = stop_recording.is_set() and whisper_queue.empty()
+        while not (stop_evt.is_set() and whisper_q.empty()):
+            try:
+                chunk = whisper_q.get(timeout=0.5)
+            except queue.Empty:
+                continue
 
-        if batch_buffer and (batch_ready or recording_done):
+            batch_buffer.extend(chunk)
+
+            batch_ready = len(batch_buffer) >= SAMPLE_RATE * WHISPER_BATCH_SECONDS
+            recording_done = stop_evt.is_set() and whisper_q.empty()
+
+            if batch_buffer and (batch_ready or recording_done):
+                segment = np.array(batch_buffer)
+                batch_buffer.clear()
+                result = _whisper_model.transcribe(
+                    segment, fp16=_WHISPER_FP16, language="en"
+                )
+                text = result["text"].strip()
+                if text:
+                    transcript.append(text)
+
+        # Flush any audio that accumulated after the last full batch was sent
+        # but before stop_evt was set (stop_evt can fire mid-timeout window).
+        if batch_buffer:
             segment = np.array(batch_buffer)
-            batch_buffer.clear()
-
-            result = whisper_model.transcribe(
-                segment,
-                fp16=WHISPER_FP16,
-                language="en"
+            result = _whisper_model.transcribe(
+                segment, fp16=_WHISPER_FP16, language="en"
             )
             text = result["text"].strip()
             if text:
                 transcript.append(text)
 
-    with open(OUTPUT_TXT, "w") as f:
-        f.write(" ".join(transcript))
-    print(f"Transcript saved to {OUTPUT_TXT}")
+        transcript_result.append(" ".join(transcript))
 
+    # ------------------------------------------------------------------
+    # Start workers and open the mic stream
+    # ------------------------------------------------------------------
+    vad_thread = threading.Thread(target=_vad_worker, daemon=True)
+    whisper_thread = threading.Thread(target=_whisper_worker, daemon=True)
+    vad_thread.start()
+    whisper_thread.start()
 
-# --- Run ---
-print("Speak now. Will stop after ~1 second of silence.\n")
+    print("[Audio_Capture] Listening... (will stop after ~1 s of silence)")
+    with sd.InputStream(
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+        blocksize=CHUNK_SAMPLES,
+        callback=_audio_callback,
+    ):
+        stop_evt.wait()  # blocks until VAD signals end-of-speech
 
-vad_thread = threading.Thread(target=vad_worker, daemon=True)
-vad_thread.start()
+    print("[Audio_Capture] Recording stopped, finishing transcription...")
+    whisper_thread.join()
 
-whisper_thread = threading.Thread(target=whisper_worker, daemon=True)
-whisper_thread.start()
-
-with sd.InputStream(
-    samplerate=SAMPLE_RATE,
-    channels=1,
-    dtype='float32',
-    blocksize=CHUNK_SAMPLES,
-    callback=audio_callback
-):
-    stop_recording.wait()
-
-print("Recording stopped, finishing transcription...")
-whisper_thread.join()
-
-sf.write(OUTPUT_WAV, np.concatenate(all_audio), SAMPLE_RATE)
-print(f"Audio saved to {OUTPUT_WAV}")
-
-print("Playing back...")
-data, sr = sf.read(OUTPUT_WAV)
-sd.play(data, sr)
-sd.wait()
-print("Playback complete.")
+    return transcript_result[0] if transcript_result else ""
