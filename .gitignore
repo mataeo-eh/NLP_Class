@@ -11,3 +11,5 @@ __pycache__
 *.zip
 Week12/
 Week13/
+AGENTS.md
+.prompts/
