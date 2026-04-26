@@ -95,6 +95,11 @@ def _rows_to_json(df: pd.DataFrame, fields: list | None) -> str:
     """
     Convert a DataFrame to a compact JSON string.
 
+    Each output row dict starts with an "index" field that holds the row's
+    position in the original data source (parquet position or CSV row number).
+    This is taken directly from df.index, so callers MUST preserve the original
+    index in df — do NOT call reset_index(drop=True) before passing the df here.
+
     If fields is provided, only those columns are included (unrecognised column names
     are silently ignored). Per-row NaN and empty-list values are dropped so the output
     stays compact. Non-serialisable types (Timestamps, pandas Int64, etc.) are
@@ -105,8 +110,11 @@ def _rows_to_json(df: pd.DataFrame, fields: list | None) -> str:
         df = df[valid_fields]
 
     rows = []
-    for _, row in df.iterrows():
-        row_dict = {}
+    for idx, row in df.iterrows():
+        # "index" is injected first so it appears at the top of each row dict in
+        # the JSON output. Cast to plain int because pandas indices are often
+        # numpy.int64, which serializes fine but reads cleaner as a Python int.
+        row_dict = {"index": int(idx)}
         for k, v in row.items():
             if _is_nan(v):
                 continue
@@ -216,7 +224,11 @@ def get_rows_by_position(
         sample_size = min(count, MAX_ROWS, n_rows)
         indices = random.sample(range(n_rows), sample_size)
 
-    result_df = df.iloc[indices].reset_index(drop=True)
+    # NOTE: do NOT call reset_index(drop=True) here. _rows_to_json reads
+    # df.index to populate the "index" field on every row, which downstream
+    # nodes (analyze, csv writers) rely on to track the original parquet
+    # position of each complaint.
+    result_df = df.iloc[indices]
     del df  # release full DataFrame from memory before returning
 
     # fields already applied via column projection above
@@ -273,7 +285,9 @@ def filter_rows(
             return json.dumps({"result": "No matching rows found for the given filters."})
 
     cap = min(limit, MAX_ROWS)
-    result_df = df.head(cap).reset_index(drop=True)
+    # Preserve df.index so _rows_to_json can attach the original parquet row
+    # position to each output dict. .head(cap) keeps the index intact.
+    result_df = df.head(cap)
     del df
 
     if result_df.empty:
@@ -425,7 +439,11 @@ def filter_csv(
     if not matched_chunks:
         return json.dumps({"result": "No matching rows found for the given filters."})
 
-    result_df = pd.concat(matched_chunks).head(cap).reset_index(drop=True)
+    # Preserve the chunk indices so each row dict carries its original CSV row
+    # position. pd.read_csv with chunksize gives each chunk an index that
+    # represents its global row position in the file (chunk 0: 0..499,
+    # chunk 1: 500..999, etc.), which survives _apply_filter and concat.
+    result_df = pd.concat(matched_chunks).head(cap)
     return _rows_to_json(result_df, fields)
 
 
@@ -483,6 +501,13 @@ def get_csv_rows_by_position(
         skiprows=lambda i: i > 0 and (i - 1) not in rows_to_keep,
         usecols=fields if fields else None,
     )
+
+    # pd.read_csv with skiprows produces a fresh RangeIndex (0..N-1) rather than
+    # preserving the original CSV positions. The kept rows arrive in the file's
+    # natural order, so we reattach the original indices by sorting our request
+    # list and assigning it back as the df.index. _rows_to_json then surfaces
+    # those positions in the "index" field of each output row.
+    df.index = pd.Index(sorted(rows_to_keep))
 
     return _rows_to_json(df, fields=None)  # fields already projected above
 
