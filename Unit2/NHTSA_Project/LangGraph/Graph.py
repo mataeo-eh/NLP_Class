@@ -1,7 +1,7 @@
 import json
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
-from Nodes import classify_task, retrieve_data, analyze, agentic_loop
+from Nodes import classify_task, retrieve_data, analyze, csv_append, agentic_loop
 from State import State
 from Edges import route_by_task_type, route_after_retrieve
 from config import mercury_llm
@@ -40,10 +40,15 @@ graph = StateGraph(State)
 graph.add_node("classify_task", classify_task)
 graph.add_node("retrieve_data", retrieve_data)
 graph.add_node("analyze", analyze)
+graph.add_node("csv_append", csv_append)
 graph.add_node("agentic_loop", agentic_loop)
 
 graph.add_edge(START, "classify_task")   # entry point
-graph.add_edge("analyze", END)
+# After analysis, persist each per-row result to the prompt's CSV before exit.
+# csv_append handles dedup against existing df_index values, so re-running
+# analysis on a previously analyzed complaint never produces a duplicate row.
+graph.add_edge("analyze", "csv_append")
+graph.add_edge("csv_append", END)
 graph.add_edge("agentic_loop", END)
 
 # classify_task routes "retrieve" and "analyze" both into retrieve_data,
@@ -67,44 +72,50 @@ graph.add_conditional_edges(
         "END":     END,
     }
 )
-
 app = graph.compile()
 
-# Greet the user via TTS so they know the system is ready, then capture their
-# spoken request and transcribe it before handing off to the graph.
-generate_TTS_audio(
-    text="Hey, welcome back. What are you looking for today?",
-    model="mlx-community/Kokoro-82M-bf16",
-    voice="af_sky",
-    speed=0.85,
-    lang_code="a",
-    play=True,
-    streaming_interval=0.2,
-    stream=True,
-    save=False,
-)
-user_request = capture_and_transcribe()
 
-result = app.invoke({
+
+
+
+
+if __name__ == "__main__":
+    # Greet the user via TTS so they know the system is ready, then capture their
+    # spoken request and transcribe it before handing off to the graph.
+    generate_TTS_audio(
+        text="Hey, welcome back. What are you looking for today?",
+        model="mlx-community/Kokoro-82M-bf16",
+        voice="af_sky",
+        speed=0.85,
+        lang_code="a",
+        play=True,
+        streaming_interval=0.2,
+        stream=True,
+        save=False,
+    )
+    user_request = capture_and_transcribe()
+    
+    result = app.invoke({
     "user_request": user_request,
     "task_type": "",
-    "query_result": "",
+    "query_result": [],          # list[dict] — populated by retrieve_data
     "reasoning_output": "",
-    "analysis": "",
+    "analysis": [],              # list[dict] — populated by analyze (per-row results)
+    "analysis_prompt_name": "",  # str — populated by analyze, consumed by csv_append
     "response": ""
 })
 
-generate_TTS_audio(
-    text=json_to_spoken_text(result),
-    model="mlx-community/Kokoro-82M-bf16",
-    voice="af_sky",
-    speed=0.85,
-    lang_code="a",
-    play=True,
-    streaming_interval = 0.2,
-    # stream=True prevents the library from writing audio to disk.
-    # Without it, generate_audio always calls audio_write() regardless of play=True.
-    # save defaults to False, so audio is only queued to AudioPlayer, never persisted.
-    stream=True,
-    save=False,
-)
+    generate_TTS_audio(
+        text=json_to_spoken_text(result["response"]),
+        model="mlx-community/Kokoro-82M-bf16",
+        voice="af_sky",
+        speed=0.85,
+        lang_code="a",
+        play=True,
+        streaming_interval = 0.2,
+        # stream=True prevents the library from writing audio to disk.
+        # Without it, generate_audio always calls audio_write() regardless of play=True.
+        # save defaults to False, so audio is only queued to AudioPlayer, never persisted.
+        stream=True,
+        save=False,
+    )

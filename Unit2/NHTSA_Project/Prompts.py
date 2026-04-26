@@ -233,6 +233,47 @@ Assign every label from the taxonomy that applies — do not limit yourself to o
     return {"system": system_prompt, "user": user_prompt}
 
 
+# ---------------------------------------------------------------------------
+# Analysis prompt registry
+# ---------------------------------------------------------------------------
+# Explicit allow-list of prompts that are eligible for the analyze node's
+# selection step. The analyze node uses gpt-5.1 to pick ONE entry from this
+# dict by name, then calls the associated function with a complaint string to
+# build the system+user messages that gpt-5.4-mini will execute.
+#
+# This is intentionally separate from get_available_prompts(): that helper
+# returns every *_Prompt function in the module — including Retrieve_Data_Prompt,
+# which is for retrieval, not analysis. The analyze node must NEVER pick a
+# non-analysis prompt, so we maintain a hand-curated registry here.
+#
+# Each entry maps:
+#   prompt_name (str) -> (callable_prompt_fn, when_to_use_description)
+#
+# The "when_to_use" string is injected into the gpt-5.1 selection meta-prompt
+# so the model can reason about which prompt fits the user's request best.
+# To add a new analysis prompt: define the function above, then add a single
+# line here describing when it should be selected.
+# ---------------------------------------------------------------------------
+ANALYSIS_PROMPTS = {
+    "Safety_Prompt": (
+        Safety_Prompt,
+        "Use when the user wants a deep safety evaluation of a complaint: "
+        "estimate level of danger, urgency for human review, assign a safety "
+        "category, and produce thorough reasoning. Output is a JSON object with "
+        "safety_category, level_of_danger, urgency_for_human_review, and "
+        "reasoning_and_justification.",
+    ),
+    "Specific_Subsystem_Prompt": (
+        Specific_Subsystem_Prompt,
+        "Use when the user wants to classify which NHTSA component category or "
+        "categories a complaint belongs to. Output is a JSON object with "
+        "subsystems (a list of NHTSA taxonomy labels), confidence, and reasoning. "
+        "Pick this prompt when the user asks about components, subsystems, or "
+        "what part of the vehicle a complaint relates to.",
+    ),
+}
+
+
 def Specify_Task_Type(user_request: str):
     # Routes a user request into one of three task types that control how the LangGraph
     # pipeline behaves downstream. The distinction that matters most:
