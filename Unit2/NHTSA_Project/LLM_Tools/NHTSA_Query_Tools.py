@@ -29,6 +29,7 @@ import os
 import sys
 import json
 import random
+import numpy as np
 import pandas as pd
 from pathlib import Path
 from langchain_core.tools import tool
@@ -65,11 +66,24 @@ MAX_ROWS = 10
 # Private helpers
 # ---------------------------------------------------------------------------
 
+# Python list and numpy.ndarray are both treated as "list-like" cell containers.
+# Build_DF.py writes Python lists into deduplicated columns, but pyarrow rehydrates
+# them as numpy.ndarray on read, so every helper that inspects cell type must
+# accept both.
+_LIST_LIKE = (list, np.ndarray)
+
+
+def _is_listlike(v) -> bool:
+    """True for Python list or numpy.ndarray cells."""
+    return isinstance(v, _LIST_LIKE)
+
+
 def _is_nan(v) -> bool:
     """Return True for any flavor of missing value, safely handling list-typed cells."""
     if v is None:
         return True
-    if isinstance(v, list):
+    if _is_listlike(v):
+        # Empty list / empty ndarray represents a null after Build_DF._normalize_list_columns.
         return len(v) == 0
     try:
         return pd.isna(v)
@@ -92,7 +106,15 @@ def _rows_to_json(df: pd.DataFrame, fields: list | None) -> str:
 
     rows = []
     for _, row in df.iterrows():
-        row_dict = {k: v for k, v in row.items() if not _is_nan(v)}
+        row_dict = {}
+        for k, v in row.items():
+            if _is_nan(v):
+                continue
+            # Convert ndarray cells (parquet-rehydrated lists) to plain lists so the
+            # JSON output is a real array rather than the str repr of an ndarray.
+            if isinstance(v, np.ndarray):
+                v = v.tolist()
+            row_dict[k] = v
         rows.append(row_dict)
 
     return json.dumps(rows, default=str, indent=2)
@@ -102,22 +124,41 @@ def _apply_filter(df: pd.DataFrame, col: str, val) -> pd.DataFrame:
     """
     Apply a single equality filter to a DataFrame column.
 
-    Handles list-typed columns (e.g. COMPDESC after deduplication in Build_DF.py)
-    by checking whether val is a member of the list rather than requiring exact
-    equality. For scalar columns, performs a standard equality comparison.
-    Silently ignores filter columns that do not exist in the DataFrame.
+    Handles list-typed columns (e.g. COMPDESC, MAKETXT, MFR_NAME after deduplication
+    in Build_DF.py) by checking whether val is a member of the cell rather than
+    requiring exact equality. For scalar columns, performs a standard equality
+    comparison. Silently ignores filter columns that do not exist in the DataFrame.
+
+    NOTE: parquet (pyarrow) rehydrates Python lists as numpy.ndarray, so we use
+    _is_listlike() rather than isinstance(..., list) — otherwise comparing
+    `ndarray == scalar` returns an elementwise boolean array per cell, which
+    pandas cannot reduce to a row mask and raises:
+        ValueError: The truth value of an array with more than one element is ambiguous.
     """
     if col not in df.columns:
         return df
 
-    # Detect list-typed columns by inspecting the first non-null value
-    sample = df[col].dropna()
-    if len(sample) > 0 and isinstance(sample.iloc[0], list):
+    # Detect list-typed columns by probing the first cell that is neither NaN nor empty.
+    # An empty ndarray is also list-like, so it would also send us down the list branch,
+    # but we prefer a non-empty probe so we never mis-classify a column whose first row
+    # happens to be a stray empty array.
+    probe = None
+    for v in df[col]:
+        if _is_nan(v):
+            continue
+        probe = v
+        break
+
+    if probe is not None and _is_listlike(probe):
         # List column — check membership rather than equality.
         # val may itself be a list (LLM passing multiple values), so accept any match.
         if isinstance(val, list):
-            return df[df[col].apply(lambda x: any(v in x for v in val) if isinstance(x, list) else x in val)]
-        return df[df[col].apply(lambda x: val in x if isinstance(x, list) else x == val)]
+            return df[df[col].apply(
+                lambda x: any(v in x for v in val) if _is_listlike(x) else x in val
+            )]
+        return df[df[col].apply(
+            lambda x: val in x if _is_listlike(x) else x == val
+        )]
 
     # Scalar column — use isin() when val is a list so pandas gets a proper boolean mask
     if isinstance(val, list):
