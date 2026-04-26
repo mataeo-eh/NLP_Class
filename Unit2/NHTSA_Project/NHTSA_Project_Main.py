@@ -31,27 +31,46 @@ try:
     api_key = os.environ["OPENAI_API_KEY"]
 except KeyError:
     raise EnvironmentError(
-        "LITELLM_API_KEY is not set. "
-        "Export your provider API key before running this script, e.g.:\n"
-        "  export LITELLM_API_KEY='sk-...'"
+        "OPENAI_API_KEY is not set. "
+        "Export your OpenAI API key before running this script, e.g.:\n"
+        "  export OPENAI_API_KEY='sk-...'"
     )
 
-try:
-    api_base = os.environ["LITELLM_API_BASE"]
-except KeyError:
-    raise EnvironmentError(
-        "LITELLM_API_BASE is not set. "
-        "Export the base URL of your LiteLLM proxy or provider endpoint, e.g.:\n"
-        "  export LITELLM_API_BASE='http://localhost:4000'"
-    )
+# Resolve model selection deterministically:
+# 1. If LITELLM_MODEL is set, route through the configured LiteLLM proxy/base.
+# 2. Otherwise fall back to OPENAI_MODEL and let LiteLLM use OpenAI's default
+#    endpoint by omitting api_base from the request.
+litellm_model = os.environ.get("LITELLM_MODEL")
+openai_model = os.environ.get("OPENAI_MODEL")
 
-try:
-    model = os.environ["LITELLM_MODEL"]
-except KeyError:
+if litellm_model:
+    model = litellm_model
+    try:
+        api_base = os.environ["LITELLM_API_BASE"]
+    except KeyError:
+        raise EnvironmentError(
+            "LITELLM_API_BASE is not set. "
+            "When LITELLM_MODEL is used, export the base URL of your LiteLLM "
+            "proxy or provider endpoint, e.g.:\n"
+            "  export LITELLM_API_BASE='http://localhost:4000'"
+        )
+elif openai_model:
+    # OPENAI_MODEL usually stores the native OpenAI model id (for example
+    # "gpt-4o" or "gpt-5.4-mini"). LiteLLM's cross-provider router is more
+    # deterministic when the provider is explicit, so normalize bare OpenAI
+    # names to the provider/model form it documents for multi-provider calls.
+    model = (
+        openai_model
+        if "/" in openai_model
+        else f"openai/{openai_model}"
+    )
+    api_base = None
+else:
     raise EnvironmentError(
-        "LITELLM_MODEL is not set. "
-        "Export the model identifier in 'provider/model-name' format, e.g.:\n"
-        "  export LITELLM_MODEL='openai/gpt-4o'"
+        "Neither LITELLM_MODEL nor OPENAI_MODEL is set. "
+        "Export one of them before running this script, e.g.:\n"
+        "  export LITELLM_MODEL='openai/gpt-4o'\n"
+        "  export OPENAI_MODEL='gpt-4o'"
     )
 
 # ---------------------------------------------------------------------------
@@ -134,62 +153,57 @@ def LLM_Tools():
     return tools
 
 def Call_LLM(messages = None, tools = None, on_chunk = None):
-    response = completion(
+    completion_kwargs = {
+        "model": model,
+        # Which model to call. LiteLLM commonly uses a "provider/model-name"
+        # format such as "openai/gpt-4o" when routing across providers, while
+        # OpenAI-native names like "gpt-4o" also work for direct OpenAI calls.
 
-    model=model,
-    # Which model to call. LiteLLM uses a "provider/model-name" format,
-    # e.g. "openai/gpt-4o", "anthropic/claude-3-5-sonnet-20241022",
-    # "ollama/llama3". The provider prefix tells LiteLLM which SDK adapter
-    # to use under the hood.
+        "messages": messages,
+        # The conversation history. See the `messages` list above.
 
-    messages=messages,
-    # The conversation history. See the `messages` list above.
+        "api_key": api_key,
+        # The API key sent to the upstream provider. Overrides any key already
+        # set via environment variable for this single call.
 
-    api_key=api_key,
-    # The API key sent to the upstream provider. Overrides any key already
-    # set via environment variable for this single call. Useful when rotating keys or calling multiple providers in the same script.
+        "temperature": 0.2,
+        # Controls randomness. Range: 0.0 – 2.0.
 
-    api_base=api_base,
-    # The base URL of the endpoint to hit. Required when pointing at a
+        "max_tokens": 8000,
+        # Maximum number of tokens the model may generate in its response.
 
-    temperature=0.2,
-    # Controls randomness. Range: 0.0 – 2.0.
-    
-    max_tokens=8000,
-    # Maximum number of tokens the model may generate in its response.
+        "tools": tools,
+        # List of tool/function schemas the model may call.
 
-    tools=tools,
-    # List of tool/function schemas the model may call. 
+        "tool_choice": "auto",
+        # Controls whether and which tool(s) the model uses.
 
+        "stream": True,
+        "timeout": 60,
+        # Seconds before LiteLLM raises an APITimeoutError if the provider
+        # has not responded. Prevents the script from hanging indefinitely.
+        # Catch with: except openai.APITimeoutError.
 
-    tool_choice="auto",
-    # Controls whether and which tool(s) the model uses.
+        "num_retries": 5,
+        # LiteLLM will automatically retry this call up to 5 times on transient
+        # server-side errors (rate limits, 5xx, timeouts) before raising. This
+        # is the first line of defense; process_and_store_response adds an outer
+        # retry layer on top for errors that exhaust even these attempts.
 
-    stream=True,
+        "drop_params": True,
+        # When True, LiteLLM silently drops any parameter that the target
+        # provider does not support, instead of raising an error.
 
-    timeout=60,
-    # Seconds before LiteLLM raises an APITimeoutError if the provider
-    # has not responded. Prevents the script from hanging indefinitely.
-    # Catch with: except openai.APITimeoutError.
+        "stream_options": {"include_usage": True},
+    }
 
-    num_retries=5,
-    # LiteLLM will automatically retry this call up to 3 times on transient
-    # server-side errors (rate limits, 5xx, timeouts) before raising. This is
-    # the first line of defense; process_and_store_response adds an outer retry
-    # layer on top for errors that exhaust even these attempts.
+    # Only send api_base when we are intentionally targeting a LiteLLM proxy or
+    # other custom endpoint. When OPENAI_MODEL is the selected fallback, leaving
+    # api_base unset lets LiteLLM use the default OpenAI endpoint.
+    if api_base is not None:
+        completion_kwargs["api_base"] = api_base
 
-        # ------------------------------------------------------------------
-    # DEBUGGING (LiteLLM-specific)
-    # ------------------------------------------------------------------
-
-    drop_params=True,
-    # When True, LiteLLM silently drops any parameter that the target
-    # provider does not support, instead of raising an error. Useful when
-    # writing provider-agnostic code that passes all params regardless of
-    # the backend. Commented out here so unsupported params surface as errors during development.
-
-    stream_options={"include_usage": True},
-    )
+    response = completion(**completion_kwargs)
     content        = ""
     finish_reason  = None
     prompt_tokens  = 0
@@ -357,7 +371,7 @@ def get_selected_prompt_functions(prompt_selection_enabled, prompt_selectors=Non
 
 '''
 Example CLI usage
-python Unit2/NHTSA_Project/NHTSA_Project_Main.py --samples 1000 --random-sampling --prompts Specific_Subsystem_Prompt
+python Unit2/NHTSA_Project/NHTSA_Project_Main.py --samples 5 --random-sampling --prompts Specific_Subsystem_Prompt
 '''
 # ---------------------------------------------------------------------------
 # Argument Parser
