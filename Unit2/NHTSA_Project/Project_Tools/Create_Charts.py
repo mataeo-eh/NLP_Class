@@ -18,24 +18,36 @@ def create_bar_chart(csv_path, columns, output_dir):
         print(f"Error reading {csv_path}: {e}")
         return
 
+    # Track the last figure created so callers (e.g. Chart_Tools.py) can
+    # capture it via the return value. Each loop iteration creates a new figure,
+    # so we grab the current figure with plt.gcf() right before plt.close().
+    last_fig = None
+
     for col in columns:
         if col not in df.columns:
             print(f"Warning: Column '{col}' not found in {csv_path}. Skipping.")
             continue
-            
+
         counts = df[col].value_counts()
-        
+
         plt.figure(figsize=(10, 6))
         counts.plot(kind='bar')
         plt.title(f"Counts of {col}")
         plt.xlabel(col)
         plt.ylabel("Count")
         plt.tight_layout()
-        
+
         output_file = os.path.join(charts_dir, f"{col}_bar_chart.png")
         plt.savefig(output_file)
+        # Capture the figure object BEFORE closing — Chart_Tools.py uses the
+        # returned fig to render to an in-memory PNG (Agg backend) rather than
+        # saving to disk. We store only the last figure from the loop; callers
+        # that need a specific column should pass a single-element columns list.
+        last_fig = plt.gcf()
         plt.close()
         print(f"Saved bar chart for '{col}' to {output_file}")
+
+    return last_fig
 
 def create_model_year_chart(df_path, *, include_year=False):
     """
@@ -191,7 +203,12 @@ def create_model_year_chart(df_path, *, include_year=False):
     ax.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{int(x):,}"))
 
     plt.tight_layout()
+    # Capture the figure object before plt.show() so Chart_Tools.py can grab it.
+    # plt.subplots() above returned (fig, ax) but discarded fig via the _ pattern;
+    # plt.gcf() retrieves the same object from matplotlib's internal state tracker.
+    fig = plt.gcf()
     plt.show()
+    return fig
 
 
 def compare_LLM_to_NHTSA(csv_path, parquet_path):
@@ -531,6 +548,9 @@ def compare_LLM_to_NHTSA(csv_path, parquet_path):
         cbar.ax.tick_params(labelsize=8)
 
     plt.show()
+    # compare_LLM_to_NHTSA explicitly builds `fig` via plt.figure() above,
+    # so no plt.gcf() is needed here — just return it directly.
+    # Chart_Tools.py uses this fig to render to an in-memory PNG.
 
     # --- print full-disagreement complaints --------------------------------
     # These are cases where the LLM's labels shared zero overlap with the
@@ -544,3 +564,5 @@ def compare_LLM_to_NHTSA(csv_path, parquet_path):
         print(f"    LLM labels:   {', '.join(sorted(llm_lbls))}")
         print(f"    {text}")
         print()
+
+    return fig
