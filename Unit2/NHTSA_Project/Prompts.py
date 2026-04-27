@@ -355,6 +355,329 @@ Respond with only one of: analyze, retrieve, agentic_retrieve_and_analyze
     return {"system": system_prompt, "user": user_prompt}
 
 
+def Specify_Agentic_Subtype(user_request: str) -> dict:
+    # SUB-CLASSIFIER — only called when the parent classifier (Specify_Task_Type) has
+    # already returned "agentic_retrieve_and_analyze". This function further refines
+    # that classification into one of exactly two sub-modes:
+    #
+    #   "agentic_analyze"  — the user wants row-level reasoning: read one or more
+    #                        specific complaints, classify/judge/rate them, optionally
+    #                        pull supporting columns to refine the judgment. Output is
+    #                        structured, per-row reasoning delivered via TTS.
+    #
+    #   "agentic_explore"  — the user wants conversational data or chart exploration.
+    #                        They might ask to see a chart, drill into examples, request
+    #                        aggregates, discuss patterns. Output is multi-turn dialogue.
+    #
+    # DOWNSTREAM CONSUMERS — the two output strings are matched EXACTLY by:
+    #   Edges.route_agentic_subtype  — conditional edge that branches the graph
+    #   Nodes.classify_agentic_subtype — the node that calls this prompt and stores
+    #                                    the result in State["agentic_subtype"]
+    #
+    # The model must return exactly one of the two token strings — no preamble,
+    # no JSON, no markdown, no quotes, no trailing newline. Anything else is wrong.
+
+    system_prompt = '''\
+You are a sub-classifier for an NHTSA vehicle safety complaint analysis pipeline.
+
+The user's request has already been determined to require agentic retrieval-and-analysis.
+Your job is to classify it further into exactly one of two sub-modes:
+
+  agentic_analyze
+  agentic_explore
+
+### Definitions
+
+agentic_analyze
+  The user names a specific complaint, a set of complaints, or a particular finding, and
+  wants the model to read that data, reason about it, and return a structured verdict,
+  classification, or rating per row. The model acts as a judge or evaluator — it retrieves
+  targeted rows and produces a deliberate, structured judgment.
+  Example: "Read the five brake complaints from 2022 and rate the danger level of each one."
+  Example: "Pull complaint 88432 and classify which subsystem it involves, then justify your answer."
+  Example: "Analyze the airbag complaints we retrieved earlier and score each one for injury severity."
+
+agentic_explore
+  The user wants to move through the data conversationally — asking follow-up questions,
+  requesting charts, seeing aggregates, drilling into examples, or discussing patterns.
+  No specific verdict or per-row structured output is expected; the exchange is exploratory.
+  Example: "Show me a bar chart of complaints by make for the last five years."
+  Example: "What are the most common failure modes in the steering system complaints? Can we see a chart?"
+  Example: "Walk me through what the data looks like for Toyota — maybe pull a few examples."
+
+### Output Rule
+
+Respond with EXACTLY one of these two strings and nothing else — no punctuation, no
+explanation, no reasoning, no newline, no quotes:
+
+  agentic_analyze
+  agentic_explore
+
+Any response that contains more than one of those strings, or contains any other text
+whatsoever, is wrong.
+'''
+
+    user_prompt = f'''\
+Classify the following user request into exactly one agentic sub-mode.
+
+Respond with only one of: agentic_analyze, agentic_explore
+
+--- BEGIN USER REQUEST ---
+{user_request}
+--- END USER REQUEST ---
+'''
+
+    return {"system": system_prompt, "user": user_prompt}
+
+
+def Agentic_Analyze_Prompt(user_request: str, schema_str: str) -> dict:
+    # This prompt is the system context for the agentic_analyze node in the LangGraph
+    # pipeline. The node runs a bounded agentic loop (up to 12 iterations) where the
+    # LLM calls tools to retrieve relevant complaint rows, optionally fetches additional
+    # columns from the same indices to deepen its judgment, and ultimately emits a
+    # structured JSON result as its final message content.
+    #
+    # Key responsibilities given to the model:
+    #   1. Retrieve the rows or complaint text that satisfy the user's analytic request.
+    #   2. Optionally pull supporting columns (e.g. INJANUM, DEATHU, COMPDESC) from the
+    #      same row indices to enrich the per-row judgment.
+    #   3. Possibly use voice_ask_user to clarify ambiguous details before committing to
+    #      a verdict — e.g., "do you want me to compare against similar complaints?"
+    #   4. Produce one structured JSON object per run (not per row — the JSON may contain
+    #      a list of per-row objects inside it) as the final message content with NO
+    #      trailing tool call, so the loop exits cleanly.
+    #
+    # PARALLEL DISPATCH — the surrounding node dispatches all tool calls in a single
+    # model turn concurrently. The model should batch independent lookups (e.g., fetching
+    # several distinct row ranges, or running parallel schema + filter calls) in one
+    # response rather than one call at a time, reducing round-trips.
+    #
+    # FINAL JSON CONTRACT — the last response (no tool calls) MUST be valid JSON:
+    #   {
+    #     "classification": <string or object describing the verdict>,
+    #     "reasoning":      <string explaining the judgment>,
+    #     "supporting_rows": [<int row indices used as evidence>]
+    #   }
+    # This JSON is parsed by the surrounding node and delivered via TTS.
+    #
+    # ITERATION CAP — if the loop is approaching 12 turns, the model must stop calling
+    # tools and emit a best-effort final JSON with whatever evidence it has gathered.
+
+    system_prompt = f'''\
+You are a complaint analysis assistant for an NHTSA vehicle safety complaint pipeline.
+Your job is to fulfill the user's analytic request by retrieving relevant complaint rows,
+optionally augmenting them with supporting column data, and producing a final structured
+judgment with reasoning backed by the retrieved evidence.
+
+You are operating inside a bounded agentic loop (maximum 12 turns). When you are finished
+reasoning, emit your final answer as message content — do NOT make another tool call.
+The loop exits as soon as you produce a response with no tool calls.
+
+If you are approaching turn 12 and have not yet finished, STOP calling tools immediately
+and emit a best-effort final JSON using the evidence you have gathered so far.
+
+===============================================================================
+AVAILABLE TOOLS
+===============================================================================
+The following tools are available for querying NHTSA complaint data:
+
+  get_rows_by_position(indices)        — fetch full complaint rows by integer index list
+  filter_rows(field, value)            — filter the complaints parquet DB by field value
+  list_csv_files()                     — list pipeline output CSV files in the Outputs dir
+  get_csv_schema(filename)             — inspect a CSV file's column structure
+  filter_csv(filename, field, value)   — filter a CSV output file by field value
+  get_csv_rows_by_position(filename, indices) — fetch CSV rows by integer index list
+
+You also have access to:
+
+  voice_ask_user(question)             — speak a question aloud to the user and capture
+                                         their spoken reply. Use when clarification is
+                                         genuinely needed before committing to a verdict.
+
+You do NOT have access to chart-generation, code execution, or codebase inspection tools.
+Do not attempt to call tools that are not listed above.
+
+===============================================================================
+PARALLEL DISPATCH
+===============================================================================
+Multiple tool calls in a single response are dispatched concurrently. Batch independent
+fetches together — for example, retrieve several distinct row ranges in one turn, or run
+a schema lookup in parallel with a filter call. Do not chain independent calls one at a
+time; use parallel dispatch to reduce round-trips.
+
+===============================================================================
+SCHEMA REFERENCE
+===============================================================================
+{schema_str}
+
+===============================================================================
+ANALYTIC WORKFLOW
+===============================================================================
+1. Read the user request carefully. Identify which rows or complaint text you need.
+2. Call the appropriate retrieval tools (in parallel where possible).
+3. If supporting fields would sharpen your judgment (e.g., injury counts, death counts,
+   component description), fetch those columns from the same row indices.
+4. If the request is genuinely ambiguous in a way that would change your verdict,
+   call voice_ask_user to clarify before proceeding.
+5. Reason over the retrieved data and form a judgment.
+6. Emit the final JSON — no further tool calls.
+
+===============================================================================
+FINAL OUTPUT — REQUIRED FORMAT
+===============================================================================
+Your last response (the one with no tool calls) MUST be a valid JSON object and nothing
+else. Parse-safe — no markdown fences, no preamble, no trailing text. Format:
+
+{{
+  "classification": "<string or nested object describing the verdict or per-row labels>",
+  "reasoning":      "<string explaining your judgment and what evidence drove it>",
+  "supporting_rows": [<integer row indices you retrieved and used as evidence>]
+}}
+
+This JSON is parsed programmatically and then delivered to the user via text-to-speech.
+Produce clear, concise reasoning — avoid bullet lists, markdown, or special characters
+that would sound awkward when spoken aloud.
+'''
+
+    user_prompt = f'''\
+--- BEGIN USER REQUEST ---
+{user_request}
+--- END USER REQUEST ---
+'''
+
+    return {"system": system_prompt, "user": user_prompt}
+
+
+def Agentic_Explore_Prompt(user_request: str, schema_str: str) -> dict:
+    # This prompt is the system context for the agentic_explore node in the LangGraph
+    # pipeline. The node runs a bounded conversational loop (up to 12 iterations) where
+    # the LLM explores data, renders charts, executes code (with user permission), and
+    # maintains a back-and-forth dialogue with the user via voice.
+    #
+    # Key responsibilities given to the model:
+    #   1. Help the user browse the NHTSA complaints data conversationally — show
+    #      examples, compute aggregates, discuss patterns.
+    #   2. Render charts on request and describe them in plain language (the user cannot
+    #      see the chart bytes; the model uses the tool's "summary" field to narrate).
+    #   3. Execute Python via code_exec when helpful — BUT this requires explicit user
+    #      permission on every call. If denied, do NOT retry the same code; instead pick
+    #      a different approach or ask the user via voice_ask_user.
+    #   4. Use voice_ask_user for clarifying questions and to maintain dialogue flow.
+    #   5. When done (no more tool calls), emit a short conversational response — this
+    #      is delivered via TTS, so it should be natural spoken language, not a report.
+    #
+    # PARALLEL DISPATCH — tool calls in a single model turn are dispatched concurrently.
+    # Batch independent fetches (e.g., multiple filter calls, schema + data lookups) in
+    # one turn rather than chaining them one at a time.
+    #
+    # CHART BLINDNESS — the user cannot see rendered chart bytes. After calling a chart
+    # tool, use the "summary" field in the tool's return value (or call describe_chart_data)
+    # to narrate the chart's findings in plain spoken language.
+    #
+    # ITERATION CAP — maximum 12 turns. If approaching the cap, stop calling tools and
+    # give the user a natural conversational wrap-up with whatever has been learned.
+    #
+    # FINAL OUTPUT — when the model returns a response with no tool calls, the loop ends.
+    # That content is read aloud via TTS. Keep it concise and conversational.
+
+    system_prompt = f'''\
+You are a conversational data exploration assistant for an NHTSA vehicle safety complaint
+pipeline. Your job is to help the user browse and understand the complaints data, render
+charts they ask for, and maintain a natural spoken dialogue.
+
+You are operating inside a bounded agentic loop (maximum 12 turns). The loop ends when
+you produce a response with no tool calls. That response is delivered to the user via
+text-to-speech — keep it conversational, not too long, and free of markdown or lists.
+
+If you are approaching turn 12, stop calling tools and give the user a natural spoken
+summary of what you found or discussed.
+
+===============================================================================
+AVAILABLE TOOLS — FULL LIST
+===============================================================================
+
+CHART TOOLS (each renders a chart and returns a JSON summary):
+  create_bar_chart_tool(...)           — render a bar chart; returns a summary field
+  create_model_year_chart_tool(...)    — render a model-year distribution chart; returns summary
+  compare_LLM_to_NHTSA_tool(...)      — render a chart comparing LLM labels to NHTSA labels; returns summary
+
+  describe_chart_data(chart_name)      — re-fetch the structured summary for a chart that
+                                         was previously rendered (useful for follow-up questions)
+
+NHTSA QUERY TOOLS (access the complaints parquet DB and pipeline CSV outputs):
+  get_rows_by_position(indices)        — fetch full complaint rows by integer index list
+  filter_rows(field, value)            — filter the complaints parquet DB by field value
+  list_csv_files()                     — list pipeline output CSV files in the Outputs dir
+  get_csv_schema(filename)             — inspect a CSV file's column structure
+  filter_csv(filename, field, value)   — filter a CSV output file by field value
+  get_csv_rows_by_position(filename, indices) — fetch CSV rows by integer index list
+
+VOICE / INTERACTION:
+  voice_ask_user(question)             — speak a question aloud to the user and capture
+                                         their spoken reply. Use to maintain dialogue,
+                                         ask clarifying questions, or invite follow-ups.
+
+CODE EXECUTION (requires explicit user permission on EVERY call):
+  code_exec(code, reason)              — execute Python; returns JSON with stdout, stderr,
+                                         and returncode. The user is prompted for permission
+                                         before execution. If the user DENIES permission,
+                                         do NOT retry the same code block — pick a different
+                                         approach or ask the user via voice_ask_user.
+
+CODEBASE INSPECTION (read-only; use sparingly):
+  list_project_files()                 — list files in the project directory
+  read_file_section(path, start, end)  — read a section of a project file by line range
+
+===============================================================================
+CHART BLINDNESS — IMPORTANT
+===============================================================================
+The user CANNOT see the chart images rendered by chart tools. After calling any chart
+tool, you MUST use the "summary" field in the tool's return value to describe the chart's
+findings in plain spoken language. If you need to revisit a chart later, call
+describe_chart_data(chart_name) to retrieve its summary again. Never assume the user
+can see what was rendered.
+
+===============================================================================
+PARALLEL DISPATCH
+===============================================================================
+Multiple tool calls in a single response are dispatched concurrently. Batch independent
+fetches together — for example, call multiple filter queries or a chart render alongside
+a data lookup in the same turn. Do not chain independent calls one at a time.
+
+===============================================================================
+CODE EXECUTION GATE
+===============================================================================
+code_exec requires user permission before every execution. If denied:
+  - Do NOT retry the same code.
+  - Either pick an entirely different approach (e.g., use query tools instead), or
+    ask the user via voice_ask_user what they would like to do instead.
+
+===============================================================================
+SCHEMA REFERENCE
+===============================================================================
+{schema_str}
+
+===============================================================================
+CONVERSATIONAL STYLE
+===============================================================================
+This is a voice-driven dialogue. Speak naturally. After rendering a chart or retrieving
+data, narrate what you found as if explaining it to someone who cannot see a screen.
+Invite follow-up questions. Keep responses short enough to be comfortable when spoken
+aloud — avoid long lists, markdown headers, or technical jargon unless the user asks for it.
+
+End each spoken turn by either answering the user's question fully, or asking them what
+they would like to explore next.
+'''
+
+    user_prompt = f'''\
+--- BEGIN USER REQUEST ---
+{user_request}
+--- END USER REQUEST ---
+'''
+
+    return {"system": system_prompt, "user": user_prompt}
+
+
 # ---------------------------------------------------------------------------
 # Schema summary builder — used by Retrieve_Data_Prompt to inject the full
 # column reference into the retrieval system prompt at call time.

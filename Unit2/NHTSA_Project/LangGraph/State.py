@@ -31,3 +31,34 @@ class State(TypedDict):
     analysis_prompt_name: str
 
     response: str              # final text, ready to be sent to TTS
+
+    # Sub-type of the agentic task, set by classify_agentic_subtype (Nodes.py)
+    # after classify_task has already confirmed task_type ==
+    # "agentic_retrieve_and_analyze". Allowed values:
+    #   - "agentic_analyze"  — the user has a specific question; the agent should
+    #                          retrieve targeted data and produce a structured
+    #                          analysis (mirrors the non-agentic analyze path).
+    #   - "agentic_explore"  — the user wants open-ended exploration; the agent
+    #                          should browse broadly, surface patterns, and
+    #                          summarise findings without a fixed output schema.
+    #   - ""                 — default / not-yet-classified; only valid before
+    #                          classify_agentic_subtype has run.
+    # Populated by: classify_agentic_subtype (Nodes.py)
+    # Consumed by:  route_agentic_subtype (Edges.py) to fan out to the correct
+    #               agentic sub-graph node.
+    agentic_subtype: str
+
+    # Accumulator of per-iteration metadata for the agentic loop. Each entry is
+    # appended by the agentic loop node at the end of one reasoning iteration.
+    # Shape of each entry:
+    #   {
+    #       "iter":       int,        # 1-based iteration counter
+    #       "model":      str,        # model ID string used in that iteration
+    #       "tool_calls": list[str],  # names of tools invoked in that iteration
+    #       "summary":    str,        # one-sentence narrative of what happened
+    #   }
+    # Populated by: agentic_loop (Nodes.py) — one append per loop iteration.
+    # Consumed by:  (a) debugging — inspect the log to understand what the agent
+    #               did at each step; (b) TTS summary node — flatten the log into
+    #               a human-readable narration of the agent's reasoning chain.
+    iteration_log: list[dict]

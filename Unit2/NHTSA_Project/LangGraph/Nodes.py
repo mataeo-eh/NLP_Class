@@ -13,7 +13,10 @@ from dotenv import load_dotenv
 from langchain_core.messages import ToolMessage
 from Prompts import (
     Specify_Task_Type,
+    Specify_Agentic_Subtype,   # sub-classifier prompt; added by W5
     Retrieve_Data_Prompt,
+    Agentic_Analyze_Prompt,    # system+user prompts for the agentic_analyze node; added by W6
+    Agentic_Explore_Prompt,    # system+user prompts for the agentic_explore node; added by W7
     build_schema_summary,
     ANALYSIS_PROMPTS,
 )
@@ -37,6 +40,26 @@ from Project_Tools.Store_LLM_Responses import (
     ensure_output_dir,
     get_processed_df_indices,
 )
+# voice_ask_user is a LangChain @tool that speaks a question aloud via TTS and
+# returns the user's spoken reply as a string. Used by agentic_analyze to allow
+# the LLM to request clarification mid-loop when the user's intent is ambiguous.
+from Project_Tools.Voice_Tools import voice_ask_user
+# Chart tools used by agentic_explore: render bar charts, model-year charts, and
+# LLM-vs-NHTSA comparison charts; describe previously-rendered charts by name;
+# cleanup_temp_charts deletes temp PNGs (non-macOS) after the loop exits.
+from Project_Tools.Chart_Tools import (
+    create_bar_chart_tool,
+    create_model_year_chart_tool,
+    compare_LLM_to_NHTSA_tool,
+    describe_chart_data,
+    cleanup_temp_charts,
+)
+# code_exec is a LangChain @tool that executes a Python snippet ONLY after the
+# user explicitly approves it via voice — each call requires fresh permission.
+from Project_Tools.Code_Exec_Tools import code_exec
+# Codebase inspection tools: let the model list and read sections of project
+# source files so it can answer questions about pipeline internals.
+from Project_Tools.Codebase_Tools import list_project_files, read_file_section
 # ---------------------------------------------------------------------------
 # Load environment variables from a .env file
 # ---------------------------------------------------------------------------
@@ -64,6 +87,62 @@ def classify_task(state: State) -> dict:
     task_type = content.strip()
 
     return {"task_type": task_type}
+
+
+def classify_agentic_subtype(state: State) -> dict:
+    """
+    SUB-CLASSIFIER — runs only after classify_task has already confirmed that
+    task_type == "agentic_retrieve_and_analyze".  It reads the user's original
+    request and asks the LLM (via Specify_Agentic_Subtype from Prompts.py) to
+    pick one of exactly two sub-types:
+
+      "agentic_analyze"
+          The user has a concrete, answerable question.  The agent should
+          retrieve targeted rows from the NHTSA database and produce a
+          structured analysis output (safety categories, subsystems, etc.)
+          — essentially the agentic version of the non-agentic "analyze" path.
+
+      "agentic_explore"
+          The user wants open-ended discovery: browse broadly, surface
+          patterns, compare across complaints, and narrate findings without
+          a predetermined output schema.  The agent decides on its own when
+          it has collected enough evidence to summarise.
+
+    Allowed outputs: exactly "agentic_analyze" or "agentic_explore".
+    Any other string will be caught by route_agentic_subtype (Edges.py) and
+    gracefully defaulted to "agentic_explore".
+
+    Mirrors the structure of classify_task — same message-building pattern,
+    same gpt5_4_mini_llm call, same .content.strip() extraction.
+
+    Returns:
+        dict with key "agentic_subtype" set to the stripped LLM output.
+        LangGraph merges this dict into the running State automatically.
+    """
+    user_request = state["user_request"]
+
+    # Build system + user prompts from Prompts.py (W5 adds Specify_Agentic_Subtype)
+    prompts = Specify_Agentic_Subtype(user_request)
+
+    # Construct a messages list in the same role/content format used everywhere
+    # else in this file — this keeps LLM invocation consistent and makes it
+    # straightforward to add history or tool context in the future.
+    messages = [
+        {"role": "system", "content": prompts["system"]},
+        {"role": "user",   "content": prompts["user"]},
+    ]
+
+    # gpt5_4_mini_llm is the fast, cheap model — appropriate for a binary
+    # classification task where we only need a single label word, not deep
+    # reasoning.  .invoke returns an AIMessage; .content gives the text string.
+    content = gpt5_4_mini_llm.invoke(messages).content
+
+    # Strip any stray whitespace; the prompt instructs the model to return only
+    # the label ("agentic_analyze" or "agentic_explore").
+    agentic_subtype = content.strip()
+
+    return {"agentic_subtype": agentic_subtype}
+
 
 def retrieve_data(state: State) -> dict:
     user_request = state["user_request"]
@@ -390,21 +469,355 @@ def csv_append(state: State) -> dict:
     return {}
 
 
-def agentic_loop(state: State) -> dict:
+def agentic_analyze(state: State) -> dict:
+    # PURPOSE: Row-level reasoning agent for the "agentic" task branch.
+    # Unlike retrieve_data (which fetches rows for a downstream analyze node) or
+    # analyze (which runs a fixed prompt per row), agentic_analyze is a single
+    # self-contained loop: it retrieves NHTSA complaint rows, optionally pulls
+    # supporting columns, and emits a final structured JSON verdict in one pass.
+    # The verdict is not written to CSV — it is ephemeral, returned via state
+    # ["response"] and delivered to the user via TTS by the graph's main runner.
+    #
+    # MODEL: gpt5_1_llm (the strongest reasoning + tool orchestration model in
+    # this pipeline). Same model used by the retrieve_data node's LLM binding.
+    #
+    # TOOLS: All six NHTSA query tools (same set as retrieve_data) plus
+    # voice_ask_user for mid-loop clarification. Chart tools and code execution
+    # tools are intentionally excluded — this node's output is spoken, not visual.
+    #
+    # PARALLEL DISPATCH: When the model emits multiple tool_calls in one turn,
+    # all are submitted concurrently via ThreadPoolExecutor. This mirrors the
+    # parallel write strategy in csv_append and reduces round-trips when the model
+    # batches independent fetches (e.g., several row-range retrievals at once).
+    # Results are collected via as_completed and appended as ToolMessages in
+    # completion order before the next LLM turn.
+    #
+    # MAX_ITERATIONS = 12 (vs retrieve_data's 8). Exploration + verdict
+    # composition typically requires more tool-call/response cycles than pure
+    # retrieval, so the cap is raised to give the model enough turns.
+    #
+    # RETURNS: dict with:
+    #   "response"        — final str (the structured JSON verdict or fallback msg)
+    #   "iteration_log"   — list[dict] appended per iteration (carries forward any
+    #                       prior entries from state["iteration_log"])
+    #   "agentic_subtype" — hardcoded "agentic_analyze" so downstream routing
+    #                       and W7 nodes can distinguish sub-branches
+    # Does NOT touch: analysis, analysis_prompt_name, query_result fields —
+    # those belong to the analyze/retrieve_data branch, not this node.
+
     user_request = state["user_request"]
+    schema_str   = build_schema_summary()
 
-    # imagine LLM call here that reads the request
-    # Puts the result of the query, such as a content retrieval, and adds it to the state
-    query_result = "query_result"  # placeholder for now
+    # Build the prompt pair (system context + user request). Agentic_Analyze_Prompt
+    # returns {"system": <str>, "user": <str>}. We adopt the same dict-based message
+    # format that retrieve_data uses so the pattern is consistent across all nodes.
+    prompts = Agentic_Analyze_Prompt(user_request, schema_str)
+    messages = [
+        {"role": "system", "content": prompts["system"]},
+        {"role": "user",   "content": prompts["user"]},
+    ]
 
-    return {"query_result": query_result}
+    # All tools available to this node. voice_ask_user enables mid-loop TTS
+    # clarification. No chart or code-execution tools — output is spoken JSON.
+    tool_list = [
+        get_rows_by_position,
+        filter_rows,
+        list_csv_files,
+        get_csv_schema,
+        filter_csv,
+        get_csv_rows_by_position,
+        voice_ask_user,
+    ]
+    # Dict keyed by tool name for O(1) dispatch inside the loop.
+    tool_map = {t.name: t for t in tool_list}
+
+    # Bind tools to the model. This adds the tool schema to the model's context
+    # so it knows how to structure tool_call dicts in its responses.
+    llm = gpt5_1_llm.bind_tools(tool_list)
+
+    # Higher cap than retrieve_data (8) because exploration + verdict composition
+    # needs more turns than pure row retrieval.
+    MAX_ITERATIONS = 12
+
+    # Carry forward any log entries produced by earlier nodes in the same run
+    # (e.g., classify_agentic_subtype might append a classification entry).
+    iteration_log = list(state.get("iteration_log") or [])
+    final_response = ""
+
+    for i in range(MAX_ITERATIONS):
+        response = llm.invoke(messages)
+        messages.append(response)
+
+        # No tool calls → the model has produced its final answer. Capture the
+        # content string and break out of the loop cleanly.
+        if not getattr(response, "tool_calls", None):
+            final_response = (
+                response.content
+                if isinstance(response.content, str)
+                else str(response.content)
+            )
+            iteration_log.append({
+                "iter":       i,
+                "model":      "gpt-5.1",
+                "tool_calls": [],
+                "summary":    "final response emitted (no tool calls)",
+            })
+            break
+
+        tool_calls = response.tool_calls  # list of dicts: {name, args, id}
+
+        # --- Parallel dispatch ---------------------------------------------------
+        # Submit all tool calls concurrently. Independent fetches (e.g., several
+        # row-range lookups, or a schema check alongside a filter call) complete
+        # in parallel rather than sequentially, reducing total wall time.
+        # Unknown tools receive an immediate error ToolMessage without spawning a
+        # future so the model knows what went wrong on the next turn.
+        with ThreadPoolExecutor(max_workers=max(1, len(tool_calls))) as executor:
+            futures = {}
+            for tc in tool_calls:
+                tool = tool_map.get(tc["name"])
+                if tool is None:
+                    # Unknown tool — return an error immediately without a future.
+                    # Appending now (before as_completed) is safe because the
+                    # executor hasn't yielded this tc in any future.
+                    messages.append(ToolMessage(
+                        content=f"Tool error: unknown tool {tc['name']!r}",
+                        tool_call_id=tc["id"],
+                    ))
+                    continue
+                futures[executor.submit(tool.invoke, tc["args"])] = tc
+
+            # Collect results as they complete (order not guaranteed, which is fine —
+            # each ToolMessage carries its tool_call_id for the model to correlate).
+            for fut in as_completed(futures):
+                tc = futures[fut]
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    # Surface tool errors as ToolMessages so the model can adapt
+                    # rather than silently losing a result.
+                    result = f"Tool error: {exc}"
+                messages.append(ToolMessage(
+                    content=str(result),
+                    tool_call_id=tc["id"],
+                ))
+        # ------------------------------------------------------------------------
+
+        iteration_log.append({
+            "iter":       i,
+            "model":      "gpt-5.1",
+            "tool_calls": [tc["name"] for tc in tool_calls],
+            "summary":    f"dispatched {len(tool_calls)} tool call(s) in parallel",
+        })
+
+    else:
+        # Loop exhausted all 12 iterations without the model producing a tool-free
+        # response. Record the cap-fallthrough and return a graceful degradation msg.
+        final_response = "Agentic analyze reached max iterations without a final answer."
+        iteration_log.append({
+            "iter":       MAX_ITERATIONS,
+            "model":      "gpt-5.1",
+            "tool_calls": [],
+            "summary":    "iteration cap fallthrough",
+        })
+
+    return {
+        "response":        final_response,
+        "iteration_log":   iteration_log,
+        "agentic_subtype": "agentic_analyze",
+    }
 
 
-def fetch_from_database(state: State) -> dict:
+def agentic_explore(state: State) -> dict:
+    # PURPOSE: Conversational exploration agent for the "agentic" task branch.
+    # While agentic_analyze is a one-shot verdict emitter (retrieves rows, judges,
+    # returns structured JSON), agentic_explore is a multi-turn dialogue: the user
+    # can ask follow-up questions, request charts, run ad-hoc code, and browse the
+    # NHTSA complaints data interactively. The final output is a short spoken
+    # summary (TTS), not a structured JSON verdict.
+    #
+    # VOICE-EVERYWHERE UX: voice_ask_user is always in the tool list so the model
+    # can proactively check in with the user rather than guessing at intent. This
+    # is especially important when chart results need narration (the user cannot
+    # see PNG bytes) or when code_exec is about to be called (explicit permission
+    # is required every time).
+    #
+    # PARALLEL DISPATCH: When the model emits multiple tool_calls in one turn,
+    # all are submitted concurrently via ThreadPoolExecutor. This mirrors the
+    # parallel dispatch strategy in agentic_analyze and reduces round-trips when
+    # the model batches independent operations (e.g., a filter call + a schema
+    # lookup, or two independent chart renders).
+    #
+    # CODE_EXEC PERMISSION GATE: code_exec requires the user to approve every
+    # individual execution via voice. If the user denies, the model must NOT
+    # retry the same code; it should pivot to a different approach or ask the
+    # user for guidance via voice_ask_user. This gate is enforced inside
+    # code_exec itself — this node does not add a second layer.
+    #
+    # MAX_ITERATIONS = 12: Same cap as agentic_analyze. Conversational exploration
+    # can be long (chart request -> narration -> follow-up -> another chart), so
+    # 12 turns gives enough room without risking unbounded loops.
+    #
+    # MODEL: gpt5_4_mini_llm (the faster "mini" model). agentic_explore is
+    # conversational and benefits from lower latency — the user is waiting on TTS
+    # responses in real time. By contrast, agentic_analyze uses gpt5_1_llm because
+    # its structured JSON verdict demands the strongest reasoning. Here, speed
+    # and dialogue fluency are more important than maximum reasoning power.
+    #
+    # CLEANUP: After the loop ends, cleanup_temp_charts() deletes any temp PNG
+    # files that were written to disk on non-macOS platforms during chart calls.
+    # macOS Preview-stdin path produces no temp files, so this is a no-op there.
+    # Failure to clean up must not propagate — we wrap in try/except.
+    #
+    # RETURNS: dict with:
+    #   "response"        — final str (short spoken summary or fallback msg)
+    #   "iteration_log"   — list[dict] appended per iteration (carries forward any
+    #                       prior entries from state["iteration_log"])
+    #   "agentic_subtype" — hardcoded "agentic_explore" so downstream routing
+    #                       can distinguish from agentic_analyze sub-branch
+    # Does NOT touch: analysis, analysis_prompt_name, query_result fields —
+    # those belong to the analyze/retrieve_data branch, not this node.
+
     user_request = state["user_request"]
-    
-    # imagine LLM call here that reads the request
-    # Puts the result of the query, such as a content retrieval, and adds it to the state
-    query_result = "query_result"  # placeholder for now
-    
-    return {"query_result": query_result}
+    schema_str   = build_schema_summary()
+
+    # Build the prompt pair (system context + user request). Agentic_Explore_Prompt
+    # returns {"system": <str>, "user": <str>}. We use the same dict-based message
+    # format as agentic_analyze for consistency across all nodes in the pipeline.
+    prompts = Agentic_Explore_Prompt(user_request, schema_str)
+    messages = [
+        {"role": "system", "content": prompts["system"]},
+        {"role": "user",   "content": prompts["user"]},
+    ]
+
+    # Full tool list for explore: chart rendering + narration, code execution
+    # (with user permission gate), codebase inspection, voice dialogue, and all
+    # six NHTSA query tools for data access. 14 tools total.
+    tool_list = [
+        create_bar_chart_tool,
+        create_model_year_chart_tool,
+        compare_LLM_to_NHTSA_tool,
+        describe_chart_data,
+        code_exec,
+        list_project_files,
+        read_file_section,
+        voice_ask_user,
+        get_rows_by_position,
+        filter_rows,
+        list_csv_files,
+        get_csv_schema,
+        filter_csv,
+        get_csv_rows_by_position,
+    ]
+    # Dict keyed by tool name for O(1) dispatch inside the loop.
+    tool_map = {t.name: t for t in tool_list}
+
+    # Bind tools to the mini model. Lower latency than gpt5_1_llm matters here
+    # because the user is in a real-time spoken dialogue and perceives each
+    # model turn as a pause before TTS plays.
+    llm = gpt5_4_mini_llm.bind_tools(tool_list)
+
+    # Higher cap than retrieve_data (8) because conversational exploration
+    # can require many chart + narration + follow-up cycles.
+    MAX_ITERATIONS = 12
+
+    # Carry forward any log entries produced by earlier nodes in the same run
+    # (e.g., classify_agentic_subtype might append a classification entry).
+    iteration_log = list(state.get("iteration_log") or [])
+    final_response = ""
+
+    for i in range(MAX_ITERATIONS):
+        response = llm.invoke(messages)
+        messages.append(response)
+
+        # No tool calls -> the model has produced its final conversational answer.
+        # Capture the content string and break out of the loop cleanly.
+        if not getattr(response, "tool_calls", None):
+            final_response = (
+                response.content
+                if isinstance(response.content, str)
+                else str(response.content)
+            )
+            iteration_log.append({
+                "iter":       i,
+                "model":      "gpt-5.4-mini",
+                "tool_calls": [],
+                "summary":    "final response emitted (no tool calls)",
+            })
+            break
+
+        tool_calls = response.tool_calls  # list of dicts: {name, args, id}
+
+        # --- Parallel dispatch ---------------------------------------------------
+        # Submit all tool calls concurrently. Independent operations (e.g., a chart
+        # render + a schema lookup, or two separate filter calls) complete in
+        # parallel rather than sequentially, reducing total wall time during the
+        # interactive dialogue loop.
+        # Unknown tools receive an immediate error ToolMessage without spawning a
+        # future so the model knows what went wrong on the next turn.
+        with ThreadPoolExecutor(max_workers=max(1, len(tool_calls))) as executor:
+            futures = {}
+            for tc in tool_calls:
+                tool = tool_map.get(tc["name"])
+                if tool is None:
+                    # Unknown tool — return an error immediately without a future.
+                    # Appending now (before as_completed) is safe because the
+                    # executor hasn't yielded this tc in any future.
+                    messages.append(ToolMessage(
+                        content=f"Tool error: unknown tool {tc['name']!r}",
+                        tool_call_id=tc["id"],
+                    ))
+                    continue
+                futures[executor.submit(tool.invoke, tc["args"])] = tc
+
+            # Collect results as they complete (order not guaranteed, which is fine —
+            # each ToolMessage carries its tool_call_id for the model to correlate).
+            for fut in as_completed(futures):
+                tc = futures[fut]
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    # Surface tool errors as ToolMessages so the model can adapt
+                    # rather than silently losing a result.
+                    result = f"Tool error: {exc}"
+                messages.append(ToolMessage(
+                    content=str(result),
+                    tool_call_id=tc["id"],
+                ))
+        # ------------------------------------------------------------------------
+
+        iteration_log.append({
+            "iter":       i,
+            "model":      "gpt-5.4-mini",
+            "tool_calls": [tc["name"] for tc in tool_calls],
+            "summary":    f"dispatched {len(tool_calls)} tool call(s) in parallel",
+        })
+
+    else:
+        # Loop exhausted all 12 iterations without the model producing a tool-free
+        # response. Record the cap-fallthrough and return a graceful degradation msg.
+        final_response = "Agentic explore reached max iterations without a final answer."
+        iteration_log.append({
+            "iter":       MAX_ITERATIONS,
+            "model":      "gpt-5.4-mini",
+            "tool_calls": [],
+            "summary":    "iteration cap fallthrough",
+        })
+
+    # --- Temp chart cleanup -----------------------------------------------------
+    # Why: temp PNGs are kept around during the loop so the user can re-open them
+    # if needed; we clean up after the loop ends. macOS Preview-stdin path produces
+    # no temp files so this is a no-op there.
+    try:
+        cleanup_temp_charts()
+    except Exception:
+        # Cleanup failure must not propagate — the loop has already completed and
+        # the response is ready. Silently swallow so the caller always gets a result.
+        pass
+    # ----------------------------------------------------------------------------
+
+    return {
+        "response":        final_response,
+        "iteration_log":   iteration_log,
+        "agentic_subtype": "agentic_explore",
+    }
