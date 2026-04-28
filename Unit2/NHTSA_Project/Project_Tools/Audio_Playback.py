@@ -16,7 +16,7 @@ def generate_TTS_audio(
     text="Goodbye... cruel... world... I, I move towards the light.",
     model=_DEFAULT_MODEL_PATH,
     voice="af_sky",
-    speed=0.85,
+    speed=0.95,
     lang_code="a",
     streaming_interval = 0.5,
     play=True,
