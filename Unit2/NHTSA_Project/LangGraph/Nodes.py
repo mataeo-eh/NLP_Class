@@ -44,6 +44,7 @@ from Project_Tools.Store_LLM_Responses import (
 # returns the user's spoken reply as a string. Used by agentic_analyze to allow
 # the LLM to request clarification mid-loop when the user's intent is ambiguous.
 from Project_Tools.Voice_Tools import voice_ask_user
+from Project_Tools.Audio_Playback import narrate_node_result
 # Chart tools used by agentic_explore: render bar charts, model-year charts, and
 # LLM-vs-NHTSA comparison charts; describe previously-rendered charts by name;
 # cleanup_temp_charts deletes temp PNGs (non-macOS) after the loop exits.
@@ -85,6 +86,8 @@ def classify_task(state: State) -> dict:
 
     # Strip any stray whitespace; the prompt instructs the model to return only the label
     task_type = content.strip()
+
+    narrate_node_result("classify_task", {"task_type": task_type})
 
     return {"task_type": task_type}
 
@@ -140,6 +143,8 @@ def classify_agentic_subtype(state: State) -> dict:
     # Strip any stray whitespace; the prompt instructs the model to return only
     # the label ("agentic_analyze" or "agentic_explore").
     agentic_subtype = content.strip()
+
+    narrate_node_result("classify_agentic_subtype", {"agentic_subtype": agentic_subtype})
 
     return {"agentic_subtype": agentic_subtype}
 
@@ -245,6 +250,11 @@ def retrieve_data(state: State) -> dict:
     else:
         query_result = last_data_rows
 
+    narrate_node_result("retrieve_data", {
+        "row_count": len(query_result),
+        "task_type": state.get("task_type", ""),
+    })
+
     return {
         "query_result": query_result,
         "response": final_response,
@@ -324,6 +334,10 @@ Any response that contains anything other than one of those exact strings is wro
     selected_name = selection_raw if selection_raw in ANALYSIS_PROMPTS else next(iter(ANALYSIS_PROMPTS))
     prompt_fn, _selected_desc = ANALYSIS_PROMPTS[selected_name]
 
+    narrate_node_result("analyze_prompt_selected", {
+        "analysis_prompt_name": selected_name,
+    })
+
     # ----- Step 2: per-row execution via gpt-5.4-mini -----------------------
     # The chosen prompt function takes a single complaint string and returns
     # {"system": ..., "user": ...}. We call it once per row with that row's
@@ -353,6 +367,11 @@ Any response that contains anything other than one of those exact strings is wro
             parsed = {"error": "Model returned non-JSON output", "raw": raw}
 
         results.append({"index": row["index"], "result": parsed})
+
+    narrate_node_result("analyze_complete", {
+        "row_count": len(results),
+        "analysis_prompt_name": selected_name,
+    })
 
     return {
         "analysis": results,
@@ -610,6 +629,13 @@ def agentic_analyze(state: State) -> dict:
             "summary":    f"dispatched {len(tool_calls)} tool call(s) in parallel",
         })
 
+        narrate_node_result("agentic_iteration", {
+            "iter":       i,
+            "max_iter":   MAX_ITERATIONS,
+            "tool_calls": [tc["name"] for tc in tool_calls],
+            "reasoning":  f"dispatched {len(tool_calls)} tool call(s) in parallel",
+        })
+
     else:
         # Loop exhausted all 12 iterations without the model producing a tool-free
         # response. Record the cap-fallthrough and return a graceful degradation msg.
@@ -791,6 +817,13 @@ def agentic_explore(state: State) -> dict:
             "model":      "gpt-5.4-mini",
             "tool_calls": [tc["name"] for tc in tool_calls],
             "summary":    f"dispatched {len(tool_calls)} tool call(s) in parallel",
+        })
+
+        narrate_node_result("agentic_iteration", {
+            "iter":       i,
+            "max_iter":   MAX_ITERATIONS,
+            "tool_calls": [tc["name"] for tc in tool_calls],
+            "reasoning":  f"dispatched {len(tool_calls)} tool call(s) in parallel",
         })
 
     else:

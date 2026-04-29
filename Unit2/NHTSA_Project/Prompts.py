@@ -125,6 +125,36 @@ def _load_nhtsa_taxonomy() -> list[str]:
 NHTSA_COMPONENT_TAXONOMY: list[str] = _load_nhtsa_taxonomy()
 
 
+def Node_Progress_Summary_Prompt(node_name: str, context: dict) -> str:
+    # Formats a single HumanMessage prompt string for Mercury to produce a short spoken
+    # progress update after a LangGraph node completes.
+    #
+    # Mercury is used here as a lightweight spoken-language formatter, not a reasoning
+    # engine — one HumanMessage call, no system prompt, fast turnaround.
+    #
+    # Capitalization normalization is critical: upstream models output high-fidelity
+    # all-caps strings like "TOYOTA CAMRY" or "ELECTRICAL SYSTEM". The Kokoro TTS
+    # tokenizer verbalizes all-caps words character-by-character ("T-O-Y-O-T-A")
+    # instead of as words, so Mercury must normalize them to title/sentence case.
+    context_lines = "\n".join(f"  {k}: {v}" for k, v in context.items())
+    return (
+        f"A LangGraph pipeline node just completed. Here is what happened:\n\n"
+        f"Node: {node_name}\n"
+        f"Context:\n{context_lines}\n\n"
+        f"Write 2 to 4 sentences of natural spoken prose that tells the user what just happened. "
+        f"This text will be read aloud by a text-to-speech system, so follow these rules exactly:\n"
+        f"- No bullet points, no markdown, no JSON, no numbered lists\n"
+        f"- No ellipses — the TTS cannot pronounce them naturally\n"
+        f"- No parenthetical asides\n"
+        f"- Flowing, conversational prose that a listener can follow\n"
+        f"- Normalize ALL capitalization: convert every ALL-CAPS word (such as TOYOTA, CAMRY, "
+        f"NHTSA, BRAKES, ELECTRICAL SYSTEM) to title case or sentence case as appropriate. "
+        f"The TTS tokenizer spells out all-caps words letter by letter instead of speaking them "
+        f"as words, so this normalization is required for every proper noun, vehicle name, "
+        f"acronym, and dataset field value in your output."
+    )
+
+
 def get_available_prompts():
     prompt_functions = []
 
