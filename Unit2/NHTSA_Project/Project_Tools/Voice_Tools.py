@@ -42,9 +42,6 @@ from langchain_core.tools import tool
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from Project_Tools.Audio_Playback import generate_TTS_audio
-from Project_Tools.Audio_Capture import capture_and_transcribe
-
 
 @tool
 def voice_ask_user(question: str) -> str:
@@ -70,6 +67,9 @@ def voice_ask_user(question: str) -> str:
         starting with '[voice tool error:' if audio I/O fails.
     """
     try:
+        from Project_Tools.Audio_Playback import generate_TTS_audio
+        from Project_Tools.Audio_Capture import capture_and_transcribe
+
         # -- Step 1: TTS playback ------------------------------------------
         # Synthesise and play the question using the Metal-backed Kokoro model.
         # Parameters match the canonical voice config established in Graph.py's

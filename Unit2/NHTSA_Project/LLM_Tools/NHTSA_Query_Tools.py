@@ -45,8 +45,6 @@ from LangGraph.config import mercury_llm
 # Import audio pipeline — TTS for Ask_User, STT for User_Answer
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from Project_Tools.Audio_Playback import generate_TTS_audio
-from Project_Tools.Audio_Capture import capture_and_transcribe
 
 # ---------------------------------------------------------------------------
 # File path constants
@@ -541,18 +539,23 @@ def Ask_User(question: str) -> str:
         Confirmation that the question was asked. Call User_Answer() next.
     """
     # Speak the question aloud via TTS so the user hears it through their speakers.
-    generate_TTS_audio(
-        text=question,
-        model="mlx-community/Kokoro-82M-bf16",
-        voice="af_sky",
-        speed=0.85,
-        lang_code="a",
-        play=True,
-        streaming_interval=0.2,
-        stream=True,
-        save=False,
-    )
-    return "Question asked. Call User_Answer() to retrieve the response."
+    try:
+        from Project_Tools.Audio_Playback import generate_TTS_audio
+
+        generate_TTS_audio(
+            text=question,
+            model="mlx-community/Kokoro-82M-bf16",
+            voice="af_sky",
+            speed=0.85,
+            lang_code="a",
+            play=True,
+            streaming_interval=0.2,
+            stream=True,
+            save=False,
+        )
+        return "Question asked. Call User_Answer() to retrieve the response."
+    except Exception as exc:
+        return f"[audio unavailable: {exc}] Question text: {question}"
 
 
 @tool
@@ -571,4 +574,9 @@ def User_Answer() -> str:
     """
     # Capture the user's spoken reply, transcribe it via Whisper, and return
     # the transcript string. Blocks until end-of-speech is detected.
-    return capture_and_transcribe()
+    try:
+        from Project_Tools.Audio_Capture import capture_and_transcribe
+
+        return capture_and_transcribe()
+    except Exception as exc:
+        return f"[audio unavailable: {exc}]"

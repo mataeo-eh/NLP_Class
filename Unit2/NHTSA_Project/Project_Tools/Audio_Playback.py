@@ -1,7 +1,5 @@
 import sys
 from dotenv import load_dotenv
-from mlx_audio.tts.generate import generate_audio
-from mlx_audio.tts.utils import load_model
 
 load_dotenv()
 
@@ -10,7 +8,30 @@ load_dotenv()
 # seconds; doing it here means the first TTS call has no cold-start penalty.
 # lazy=False forces all weights into memory immediately rather than on first use.
 _DEFAULT_MODEL_PATH = "mlx-community/Kokoro-82M-bf16"
-_tts_model = load_model(model_path=_DEFAULT_MODEL_PATH, lazy=False)
+_tts_model = None
+_tts_import_error = None
+
+try:
+    from mlx_audio.tts.generate import generate_audio
+    from mlx_audio.tts.utils import load_model
+except Exception as exc:
+    generate_audio = None
+    load_model = None
+    _tts_import_error = exc
+
+
+def _get_tts_model():
+    """Load the TTS model lazily so imports do not require the audio stack."""
+    global _tts_model
+    if _tts_import_error is not None:
+        raise RuntimeError(
+            "TTS audio is unavailable because mlx_audio could not be imported. "
+            "Install optional audio dependencies on a supported platform to "
+            f"enable spoken playback. Original error: {_tts_import_error}"
+        )
+    if _tts_model is None:
+        _tts_model = load_model(model_path=_DEFAULT_MODEL_PATH, lazy=False)
+    return _tts_model
 
 
 def generate_TTS_audio(
@@ -35,7 +56,7 @@ def generate_TTS_audio(
     # If the caller requests the default model, pass the pre-loaded instance to
     # skip load_model() inside generate_audio. If a different model path is given,
     # fall back to the string so generate_audio loads it fresh.
-    model_arg = _tts_model if model == _DEFAULT_MODEL_PATH else model
+    model_arg = _get_tts_model() if model == _DEFAULT_MODEL_PATH else model
 
     generate_audio(
         text=text,

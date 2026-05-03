@@ -12,7 +12,19 @@ from pprint import pprint
 # a dict below — the raw list from Build_DF has no runtime-accessible descriptions.
 # ---------------------------------------------------------------------------
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "NHTSA"))
-from NHTSA.Build_DF import NUMERIC_COLS, DATE_COLS
+try:
+    from NHTSA.Build_DF import NUMERIC_COLS, DATE_COLS
+except ModuleNotFoundError:
+    NUMERIC_COLS = {
+        "YEARTXT",
+        "INJURED",
+        "DEATHS",
+        "MILES",
+        "OCCURENCES",
+        "NUM_CYLS",
+        "VEH_SPEED",
+    }
+    DATE_COLS = {"FAILDATE", "DATEA", "LDATE", "PURCH_DT", "MANUF_DT"}
 
 # ---------------------------------------------------------------------------
 # Column descriptions for the 49-column NHTSA complaints Parquet database.
@@ -89,15 +101,21 @@ def _load_nhtsa_taxonomy() -> list[str]:
     """
     data_file = Path(__file__).parent / "NHTSA" / "COMPLAINTS_RECEIVED_2025-2026.txt"
     try:
-        df = pd.read_csv(
-            data_file,
-            sep="\t",
-            header=None,
-            usecols=[11],        # COMPDESC is the 12th column (0-based index 11)
-            dtype=str,
-            encoding="latin-1",  # NHTSA files use latin-1 encoding
-        )
-        df.columns = ["COMPDESC"]
+        if data_file.exists():
+            df = pd.read_csv(
+                data_file,
+                sep="\t",
+                header=None,
+                usecols=[11],        # COMPDESC is the 12th column (0-based index 11)
+                dtype=str,
+                encoding="latin-1",  # NHTSA files use latin-1 encoding
+            )
+            df.columns = ["COMPDESC"]
+        else:
+            parquet_file = Path(__file__).parent / "NHTSA" / "complaints_cleaned.parquet"
+            df = pd.read_parquet(parquet_file, columns=["COMPDESC"])
+            df = df.explode("COMPDESC")
+            df["COMPDESC"] = df["COMPDESC"].astype(str)
 
         # Split on ':' and take the first segment as the top-level category
         top_level = (
@@ -629,6 +647,12 @@ AVAILABLE TOOLS — FULL LIST
 CHART TOOLS (each renders a chart and returns a JSON summary):
   create_bar_chart_tool(...)           — render a bar chart; returns a summary field
   create_model_year_chart_tool(...)    — render a model-year distribution chart; returns summary
+  create_human_subsystem_frequency_chart_tool(filters, top_n)
+                                      — render a bar chart of the most frequent
+                                         human-labelled COMPDESC subsystem components;
+                                         translate the user's query into database
+                                         filters such as MAKETXT, MODELTXT, YEARTXT,
+                                         CRASH, FIRE, STATE, or COMPDESC
   compare_LLM_to_NHTSA_tool(...)      — render a chart comparing LLM labels to NHTSA labels; returns summary
 
   describe_chart_data(chart_name)      — re-fetch the structured summary for a chart that

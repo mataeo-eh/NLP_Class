@@ -3,6 +3,170 @@ import matplotlib.pyplot as plt
 import numpy as np
 import os
 
+
+def _is_missing_cell(value):
+    """Safely detect missing scalar/list-like parquet cells."""
+    if value is None:
+        return True
+    if isinstance(value, np.ndarray):
+        return value.size == 0
+    if isinstance(value, list):
+        return len(value) == 0
+    try:
+        return pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+
+
+def _cell_matches_filter(value, expected):
+    """Return True when a scalar or list-like cell matches a filter value."""
+    expected_values = expected if isinstance(expected, list) else [expected]
+    expected_strings = {str(v).strip().upper() for v in expected_values}
+
+    if isinstance(value, np.ndarray):
+        actual_values = value.tolist()
+    elif isinstance(value, list):
+        actual_values = value
+    else:
+        actual_values = [value]
+
+    actual_strings = {str(v).strip().upper() for v in actual_values}
+    return bool(actual_strings & expected_strings)
+
+
+def _apply_chart_filters(df, filters):
+    """Apply simple equality/member filters used by notebook and LangGraph charts."""
+    if not filters:
+        return df
+
+    filtered = df
+    for col, expected in filters.items():
+        if col not in filtered.columns:
+            print(f"Warning: Column '{col}' not found in dataframe. Skipping filter.")
+            continue
+        filtered = filtered[filtered[col].apply(lambda value: _cell_matches_filter(value, expected))]
+        if filtered.empty:
+            break
+    return filtered
+
+
+def _flatten_component_labels(series):
+    """Flatten COMPDESC cells into one clean label per human component assignment."""
+    labels = []
+    for value in series:
+        if _is_missing_cell(value):
+            continue
+        if isinstance(value, np.ndarray):
+            values = value.tolist()
+        elif isinstance(value, list):
+            values = value
+        else:
+            values = [value]
+
+        for label in values:
+            if _is_missing_cell(label):
+                continue
+            cleaned = str(label).strip().upper()
+            if cleaned:
+                labels.append(cleaned)
+    return labels
+
+
+def create_human_subsystem_frequency_chart(df_path, filters=None, top_n=15):
+    """
+    Plot the most frequent human-labelled subsystem components from COMPDESC.
+
+    Parameters
+    ----------
+    df_path : str
+        Path to the cleaned complaints parquet file.
+    filters : dict, optional
+        Column-to-value filters derived from the user's query. List-like columns
+        such as COMPDESC match when the requested value appears in the cell.
+        Example: {"MAKETXT": "TOYOTA", "CRASH": "Y"}.
+    top_n : int, default 15
+        Number of most frequent human component labels to display.
+
+    Returns
+    -------
+    matplotlib.figure.Figure | None
+        The rendered figure, or None if the data cannot be loaded or no labels
+        remain after filtering.
+    """
+    try:
+        df = pd.read_parquet(df_path)
+    except Exception as e:
+        print(f"Error reading {df_path}: {e}")
+        return
+
+    filters = filters or {}
+    top_n = max(1, min(int(top_n), 30))
+
+    filtered = _apply_chart_filters(df, filters)
+    if filtered.empty:
+        print("No matching complaints found for the given filters.")
+        return
+
+    if "COMPDESC" not in filtered.columns:
+        print("COMPDESC column not found; cannot chart human subsystem labels.")
+        return
+
+    labels = _flatten_component_labels(filtered["COMPDESC"])
+    if not labels:
+        print("No human subsystem labels found after filtering.")
+        return
+
+    counts = pd.Series(labels).value_counts().head(top_n)
+
+    fig_width = max(12, min(20, top_n * 0.9))
+    fig, ax = plt.subplots(figsize=(fig_width, 7))
+
+    bars = ax.bar(
+        counts.index,
+        counts.values,
+        color="#4C72B0",
+        edgecolor="none",
+        width=0.72,
+    )
+
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.yaxis.grid(True, linestyle="-", linewidth=0.6, color="#EAEAEA", alpha=0.9)
+    ax.set_axisbelow(True)
+
+    ax.set_xlabel("Human Labelled Subsystem Component", fontsize=11, labelpad=10)
+    ax.set_ylabel("Number of Complaints", fontsize=11, labelpad=10)
+
+    filter_text = "All complaints" if not filters else "Filtered complaints"
+    ax.set_title(
+        f"Top {len(counts)} Human Labelled Subsystem Components\n"
+        f"{filter_text} (n={len(filtered):,} complaints)",
+        fontsize=14,
+        fontweight="bold",
+        pad=14,
+    )
+
+    ax.tick_params(axis="x", labelrotation=45, labelsize=9)
+    for label in ax.get_xticklabels():
+        label.set_ha("right")
+
+    y_max = counts.values.max()
+    ax.set_ylim(0, y_max * 1.12)
+    for bar, value in zip(bars, counts.values):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            value + y_max * 0.015,
+            f"{int(value):,}",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#333333",
+        )
+
+    plt.tight_layout()
+    plt.show()
+    return fig
+
 def create_bar_chart(csv_path, columns, output_dir):
     """
     Reads a CSV file, creates a bar chart for the counts of unique entries

@@ -51,6 +51,7 @@ from Project_Tools.Audio_Playback import narrate_node_result
 from Project_Tools.Chart_Tools import (
     create_bar_chart_tool,
     create_model_year_chart_tool,
+    create_human_subsystem_frequency_chart_tool,
     compare_LLM_to_NHTSA_tool,
     describe_chart_data,
     cleanup_temp_charts,
@@ -722,6 +723,7 @@ def agentic_explore(state: State) -> dict:
     tool_list = [
         create_bar_chart_tool,
         create_model_year_chart_tool,
+        create_human_subsystem_frequency_chart_tool,
         compare_LLM_to_NHTSA_tool,
         describe_chart_data,
         code_exec,

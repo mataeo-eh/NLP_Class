@@ -72,6 +72,7 @@ from langchain_core.tools import tool
 sys.path.insert(0, str(Path(__file__).parent))
 from Create_Charts import (  # noqa: E402
     create_bar_chart,
+    create_human_subsystem_frequency_chart,
     create_model_year_chart,
     compare_LLM_to_NHTSA,
 )
@@ -440,6 +441,152 @@ def create_model_year_chart_tool(include_year: bool = False) -> str:
 
 
 @tool
+def create_human_subsystem_frequency_chart_tool(
+    filters: dict | None = None,
+    top_n: int = 15,
+) -> str:
+    """
+    Render a bar chart of the most frequent human-labelled subsystem components.
+
+    Data source: complaints_cleaned.parquet. The human labels come from COMPDESC,
+    the NHTSA component category field. If the user's query names a make, model,
+    crash/fire flag, state, year, or other database field, translate that request
+    into the filters dict before calling this tool. If the user asks for the
+    overall database distribution, pass filters={} or omit filters.
+
+    Examples:
+      filters={"MAKETXT": "TOYOTA"}
+      filters={"MAKETXT": "FORD", "CRASH": "Y"}
+      filters={"COMPDESC": "SERVICE BRAKES"}
+
+    IMPORTANT: you CANNOT see the rendered chart image. Use the returned
+    summary to describe the chart to the user.
+
+    Parameters
+    ----------
+    filters : dict | None
+        Column-to-value equality filters. List-like columns match by membership.
+    top_n : int, default 15
+        Number of top component labels to plot. Capped internally at 30.
+
+    Returns
+    -------
+    str
+        JSON string with keys:
+          "chart_name" : "create_human_subsystem_frequency_chart"
+          "display"    : how the chart was opened
+          "summary"    : {
+              "filters"          : dict,
+              "top_n"            : int,
+              "matching_rows"    : int,
+              "component_counts" : [{"component": str, "count": int}, ...]
+          }
+    """
+    chart_name = "create_human_subsystem_frequency_chart"
+    filters = filters or {}
+    top_n = max(1, min(int(top_n), 30))
+
+    import pandas as pd
+    import numpy as np
+
+    def _is_missing_cell(value):
+        if value is None:
+            return True
+        if isinstance(value, np.ndarray):
+            return value.size == 0
+        if isinstance(value, list):
+            return len(value) == 0
+        try:
+            return pd.isna(value)
+        except (TypeError, ValueError):
+            return False
+
+    def _cell_matches_filter(value, expected):
+        expected_values = expected if isinstance(expected, list) else [expected]
+        expected_strings = {str(v).strip().upper() for v in expected_values}
+        if isinstance(value, np.ndarray):
+            actual_values = value.tolist()
+        elif isinstance(value, list):
+            actual_values = value
+        else:
+            actual_values = [value]
+        actual_strings = {str(v).strip().upper() for v in actual_values}
+        return bool(actual_strings & expected_strings)
+
+    summary: dict = {
+        "filters": filters,
+        "top_n": top_n,
+        "matching_rows": 0,
+        "component_counts": [],
+    }
+
+    try:
+        df = pd.read_parquet(PARQUET_PATH)
+        filtered = df
+        for col, expected in filters.items():
+            if col not in filtered.columns:
+                summary.setdefault("warnings", []).append(
+                    f"Column '{col}' not found; filter skipped."
+                )
+                continue
+            filtered = filtered[filtered[col].apply(lambda value: _cell_matches_filter(value, expected))]
+            if filtered.empty:
+                break
+
+        summary["matching_rows"] = int(len(filtered))
+
+        labels = []
+        if "COMPDESC" in filtered.columns:
+            for value in filtered["COMPDESC"]:
+                if _is_missing_cell(value):
+                    continue
+                if isinstance(value, np.ndarray):
+                    values = value.tolist()
+                elif isinstance(value, list):
+                    values = value
+                else:
+                    values = [value]
+                for label in values:
+                    if _is_missing_cell(label):
+                        continue
+                    cleaned = str(label).strip().upper()
+                    if cleaned:
+                        labels.append(cleaned)
+
+        counts = pd.Series(labels).value_counts().head(top_n)
+        summary["component_counts"] = [
+            {"component": str(component), "count": int(count)}
+            for component, count in counts.items()
+        ]
+    except Exception as e:
+        summary["error"] = str(e)
+
+    _LAST_CHART_DATA[chart_name] = summary
+
+    fig = create_human_subsystem_frequency_chart(
+        str(PARQUET_PATH),
+        filters=filters,
+        top_n=top_n,
+    )
+
+    if fig is None:
+        return json.dumps({
+            "chart_name": chart_name,
+            "display": "not rendered (no matching data or data load failed)",
+            "summary": summary,
+        })
+
+    png = _render_fig_to_png(fig)
+    display_result = _display_png_bytes(png, chart_name)
+
+    return json.dumps({
+        "chart_name": chart_name,
+        "display": display_result,
+        "summary": _LAST_CHART_DATA[chart_name],
+    })
+
+
+@tool
 def compare_LLM_to_NHTSA_tool() -> str:
     """
     Render a three-subplot comparison chart of LLM subsystem predictions vs.
@@ -596,6 +743,7 @@ def describe_chart_data(chart_name: str) -> str:
     Valid chart_name values (must have been rendered first):
       - "create_bar_chart"
       - "create_model_year_chart"
+      - "create_human_subsystem_frequency_chart"
       - "compare_LLM_to_NHTSA"
 
     Parameters

@@ -13,8 +13,6 @@ from Nodes import (
 from State import State
 from Edges import route_by_task_type, route_after_retrieve, route_agentic_subtype
 from config import mercury_llm
-from Project_Tools.Audio_Playback import generate_TTS_audio
-from Project_Tools.Audio_Capture import capture_and_transcribe
 
 
 def json_to_spoken_text(data: dict | str) -> str:
@@ -113,20 +111,33 @@ app = graph.compile()
 
 
 if __name__ == "__main__":
+    try:
+        from Project_Tools.Audio_Playback import generate_TTS_audio
+        from Project_Tools.Audio_Capture import capture_and_transcribe
+        audio_available = True
+    except Exception as exc:
+        print(f"[Graph] Audio unavailable; using text input/output. Reason: {exc}")
+        generate_TTS_audio = None
+        capture_and_transcribe = None
+        audio_available = False
+
     # Greet the user via TTS so they know the system is ready, then capture their
     # spoken request and transcribe it before handing off to the graph.
-    generate_TTS_audio(
-        text="Hey, welcome back. What are you looking for today?",
-        model="mlx-community/Kokoro-82M-bf16",
-        voice="af_sky",
-        speed=0.85,
-        lang_code="a",
-        play=True,
-        streaming_interval=0.2,
-        stream=True,
-        save=False,
-    )
-    user_request = capture_and_transcribe()
+    if audio_available:
+        generate_TTS_audio(
+            text="Hey, welcome back. What are you looking for today?",
+            model="mlx-community/Kokoro-82M-bf16",
+            voice="af_sky",
+            speed=0.85,
+            lang_code="a",
+            play=True,
+            streaming_interval=0.2,
+            stream=True,
+            save=False,
+        )
+        user_request = capture_and_transcribe()
+    else:
+        user_request = input("What are you looking for today? ").strip()
     
     result = app.invoke({
     "user_request": user_request,
@@ -140,17 +151,21 @@ if __name__ == "__main__":
     "iteration_log": [],         # list[dict] — appended by agentic nodes each iteration
 })
 
-    generate_TTS_audio(
-        text=json_to_spoken_text(result["response"]),
-        model="mlx-community/Kokoro-82M-bf16",
-        voice="af_sky",
-        speed=0.85,
-        lang_code="a",
-        play=True,
-        streaming_interval = 0.2,
-        # stream=True prevents the library from writing audio to disk.
-        # Without it, generate_audio always calls audio_write() regardless of play=True.
-        # save defaults to False, so audio is only queued to AudioPlayer, never persisted.
-        stream=True,
-        save=False,
-    )
+    spoken_response = json_to_spoken_text(result["response"])
+    if audio_available:
+        generate_TTS_audio(
+            text=spoken_response,
+            model="mlx-community/Kokoro-82M-bf16",
+            voice="af_sky",
+            speed=0.85,
+            lang_code="a",
+            play=True,
+            streaming_interval = 0.2,
+            # stream=True prevents the library from writing audio to disk.
+            # Without it, generate_audio always calls audio_write() regardless of play=True.
+            # save defaults to False, so audio is only queued to AudioPlayer, never persisted.
+            stream=True,
+            save=False,
+        )
+    else:
+        print(spoken_response)
