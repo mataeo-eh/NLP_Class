@@ -72,6 +72,56 @@ def _flatten_component_labels(series):
     return labels
 
 
+def _cell_values(value):
+    """Return a parquet cell as a plain Python list of values."""
+    if _is_missing_cell(value):
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _first_clean_value(value, default="UNKNOWN"):
+    """Return the first non-empty value from a scalar/list-like parquet cell."""
+    for item in _cell_values(value):
+        if _is_missing_cell(item):
+            continue
+        cleaned = str(item).strip().upper()
+        if cleaned:
+            return cleaned
+    return default
+
+
+def _extract_model_year(value):
+    """Return a model year int, or None for missing/unknown NHTSA sentinel values."""
+    values = _cell_values(value)
+    if not values:
+        return None
+    try:
+        year = int(values[0])
+    except (TypeError, ValueError):
+        return None
+    return None if year == 9999 else year
+
+
+def _binary_yes(value):
+    """True when an NHTSA Y/N flag cell is coded as Y."""
+    return _first_clean_value(value, default="N") == "Y"
+
+
+def _numeric_value(value):
+    """Convert a scalar/list-like numeric cell to float, defaulting missing to 0."""
+    values = _cell_values(value)
+    if not values:
+        return 0.0
+    try:
+        return float(values[0])
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def create_human_subsystem_frequency_chart(df_path, filters=None, top_n=15):
     """
     Plot the most frequent human-labelled subsystem components from COMPDESC.
@@ -162,6 +212,277 @@ def create_human_subsystem_frequency_chart(df_path, filters=None, top_n=15):
             fontsize=8,
             color="#333333",
         )
+
+    plt.tight_layout()
+    plt.show()
+    return fig
+
+
+def create_subsystem_frequency_by_make_chart(df_path, makes=None, top_n=8):
+    """
+    Plot the most frequent human-labelled subsystem components by vehicle make.
+
+    If makes is omitted, the chart uses the four most common makes in the
+    database. Each subplot shows the top subsystem labels for that make.
+    """
+    try:
+        df = pd.read_parquet(df_path)
+    except Exception as e:
+        print(f"Error reading {df_path}: {e}")
+        return
+
+    if "MAKETXT" not in df.columns or "COMPDESC" not in df.columns:
+        print("Required columns MAKETXT and COMPDESC were not found.")
+        return
+
+    top_n = max(1, min(int(top_n), 15))
+    df = df.copy()
+    df["_make_key"] = df["MAKETXT"].apply(_first_clean_value)
+
+    if makes:
+        selected_makes = [str(make).strip().upper() for make in makes]
+    else:
+        selected_makes = df["_make_key"].value_counts().head(4).index.tolist()
+
+    if not selected_makes:
+        print("No vehicle makes found to chart.")
+        return
+
+    fig_height = max(4, len(selected_makes) * 3.1)
+    fig, axes = plt.subplots(
+        len(selected_makes),
+        1,
+        figsize=(13, fig_height),
+        sharex=False,
+    )
+    if len(selected_makes) == 1:
+        axes = [axes]
+
+    for ax, make in zip(axes, selected_makes):
+        make_df = df[df["_make_key"] == make]
+        labels = _flatten_component_labels(make_df["COMPDESC"])
+        counts = pd.Series(labels).value_counts().head(top_n).iloc[::-1]
+
+        if counts.empty:
+            ax.text(0.5, 0.5, f"No subsystem labels for {make}", ha="center", va="center")
+            ax.set_axis_off()
+            continue
+
+        bars = ax.barh(
+            counts.index,
+            counts.values,
+            color="#4C72B0",
+            edgecolor="none",
+            height=0.65,
+        )
+        x_max = counts.values.max()
+        for bar, value in zip(bars, counts.values):
+            ax.text(
+                value + x_max * 0.01,
+                bar.get_y() + bar.get_height() / 2,
+                f"{int(value):,}",
+                va="center",
+                ha="left",
+                fontsize=8,
+                color="#333333",
+            )
+
+        ax.set_title(f"{make} (n={len(make_df):,} complaints)", fontsize=11, fontweight="bold")
+        ax.set_xlim(0, x_max * 1.18)
+        ax.xaxis.grid(True, linestyle="--", linewidth=0.5, color="#D8D8D8", alpha=0.8)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(axis="y", labelsize=8, left=False)
+        ax.tick_params(axis="x", labelsize=8)
+
+    fig.suptitle(
+        f"Top {top_n} Human-Labelled Subsystem Components by Make",
+        fontsize=14,
+        fontweight="bold",
+        y=0.995,
+    )
+    fig.supxlabel("Number of Component Label Occurrences", fontsize=11)
+    plt.tight_layout()
+    plt.show()
+    return fig
+
+
+def create_subsystem_safety_signal_chart(df_path, top_n=15, min_complaints=100):
+    """
+    Plot crash, fire, injury, and fatality signals by human subsystem component.
+
+    Components are ranked by complaint count after exploding COMPDESC. Injury and
+    fatality rates are shown per 1,000 component-label occurrences.
+    """
+    try:
+        df = pd.read_parquet(df_path)
+    except Exception as e:
+        print(f"Error reading {df_path}: {e}")
+        return
+
+    required = {"COMPDESC", "CRASH", "FIRE", "INJURED", "DEATHS"}
+    missing = sorted(required - set(df.columns))
+    if missing:
+        print(f"Required columns missing: {missing}")
+        return
+
+    top_n = max(1, min(int(top_n), 25))
+    min_complaints = max(1, int(min_complaints))
+
+    records = []
+    for _, row in df.iterrows():
+        components = _cell_values(row["COMPDESC"])
+        for component in components:
+            if _is_missing_cell(component):
+                continue
+            cleaned = str(component).strip().upper()
+            if not cleaned:
+                continue
+            records.append({
+                "component": cleaned,
+                "crash": int(_binary_yes(row["CRASH"])),
+                "fire": int(_binary_yes(row["FIRE"])),
+                "injured": _numeric_value(row["INJURED"]),
+                "deaths": _numeric_value(row["DEATHS"]),
+            })
+
+    if not records:
+        print("No component-label records found.")
+        return
+
+    long_df = pd.DataFrame(records)
+    summary = (
+        long_df
+        .groupby("component")
+        .agg(
+            complaints=("component", "size"),
+            crashes=("crash", "sum"),
+            fires=("fire", "sum"),
+            injuries=("injured", "sum"),
+            deaths=("deaths", "sum"),
+        )
+        .reset_index()
+    )
+    summary = summary[summary["complaints"] >= min_complaints]
+    if summary.empty:
+        print("No components met the minimum complaint threshold.")
+        return
+
+    summary["crash_rate"] = summary["crashes"] / summary["complaints"] * 100
+    summary["fire_rate"] = summary["fires"] / summary["complaints"] * 100
+    summary["injury_rate_per_1k"] = summary["injuries"] / summary["complaints"] * 1000
+    summary["death_rate_per_1k"] = summary["deaths"] / summary["complaints"] * 1000
+    plot_df = summary.sort_values("complaints", ascending=False).head(top_n).iloc[::-1]
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, max(7, top_n * 0.45)), sharey=True)
+    y = np.arange(len(plot_df))
+
+    axes[0].barh(y, plot_df["complaints"], color="#4C72B0", edgecolor="none", height=0.65)
+    axes[0].set_title("Complaint Volume", fontsize=11, fontweight="bold")
+    axes[0].set_xlabel("Component-label occurrences")
+
+    axes[1].barh(y, plot_df["crash_rate"], color="#D55E00", edgecolor="none", height=0.65, label="Crash")
+    axes[1].barh(y, plot_df["fire_rate"], color="#CC79A7", edgecolor="none", height=0.35, label="Fire")
+    axes[1].set_title("Crash / Fire Rate", fontsize=11, fontweight="bold")
+    axes[1].set_xlabel("Percent of complaints")
+    axes[1].legend(loc="lower right", fontsize=8)
+
+    axes[2].barh(y, plot_df["injury_rate_per_1k"], color="#009E73", edgecolor="none", height=0.65, label="Injuries")
+    axes[2].barh(y, plot_df["death_rate_per_1k"], color="#000000", edgecolor="none", height=0.35, label="Deaths")
+    axes[2].set_title("Injury / Fatality Rate", fontsize=11, fontweight="bold")
+    axes[2].set_xlabel("People per 1,000 complaints")
+    axes[2].legend(loc="lower right", fontsize=8)
+
+    for ax in axes:
+        ax.set_yticks(y)
+        ax.set_yticklabels(plot_df["component"], fontsize=8)
+        ax.xaxis.grid(True, linestyle="--", linewidth=0.5, color="#D8D8D8", alpha=0.8)
+        ax.set_axisbelow(True)
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.spines["left"].set_visible(False)
+        ax.tick_params(axis="y", left=False)
+        ax.tick_params(axis="x", labelsize=8)
+
+    fig.suptitle(
+        f"Safety Signals by Human-Labelled Subsystem Component\n"
+        f"Top {len(plot_df)} components by volume, minimum {min_complaints:,} complaints",
+        fontsize=14,
+        fontweight="bold",
+        y=0.995,
+    )
+    plt.tight_layout()
+    plt.show()
+    return fig
+
+
+def create_model_year_trend_chart(df_path, min_year=1990, max_year=None):
+    """
+    Plot complaint volume by vehicle model year.
+
+    The chart highlights whether certain model years are overrepresented in the
+    complaint database. The NHTSA unknown-year sentinel 9999 is excluded.
+    """
+    try:
+        df = pd.read_parquet(df_path)
+    except Exception as e:
+        print(f"Error reading {df_path}: {e}")
+        return
+
+    if "YEARTXT" not in df.columns:
+        print("YEARTXT column not found.")
+        return
+
+    years = df["YEARTXT"].apply(_extract_model_year).dropna().astype(int)
+    years = years[years >= int(min_year)]
+    if max_year is not None:
+        years = years[years <= int(max_year)]
+
+    if years.empty:
+        print("No valid model years found for the requested range.")
+        return
+
+    counts = years.value_counts().sort_index()
+    fig, ax = plt.subplots(figsize=(14, 6))
+    bars = ax.bar(
+        counts.index.astype(str),
+        counts.values,
+        color="#4C72B0",
+        edgecolor="none",
+        width=0.75,
+    )
+
+    top_years = counts.sort_values(ascending=False).head(5)
+    y_max = counts.values.max()
+    for bar, year, value in zip(bars, counts.index, counts.values):
+        if year in set(top_years.index):
+            ax.text(
+                bar.get_x() + bar.get_width() / 2,
+                value + y_max * 0.015,
+                f"{int(value):,}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                color="#333333",
+            )
+
+    ax.set_title(
+        f"Complaint Volume by Vehicle Model Year\n"
+        f"Valid years {counts.index.min()}-{counts.index.max()} (n={len(years):,} complaints)",
+        fontsize=14,
+        fontweight="bold",
+        pad=14,
+    )
+    ax.set_xlabel("Vehicle Model Year", fontsize=11, labelpad=10)
+    ax.set_ylabel("Number of Complaints", fontsize=11, labelpad=10)
+    ax.yaxis.grid(True, linestyle="-", linewidth=0.6, color="#EAEAEA", alpha=0.9)
+    ax.set_axisbelow(True)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.tick_params(axis="x", labelrotation=45, labelsize=8)
+    ax.tick_params(axis="y", labelsize=9)
 
     plt.tight_layout()
     plt.show()
