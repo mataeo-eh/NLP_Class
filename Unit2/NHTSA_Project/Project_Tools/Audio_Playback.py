@@ -1,5 +1,6 @@
 import sys
 from dotenv import load_dotenv
+from Project_Tools.Runtime_Options import is_audio_enabled
 
 load_dotenv()
 
@@ -77,6 +78,9 @@ def narrate_progress(text: str) -> None:
     # Same voice and model as the main TTS for session-wide consistency.
     # Used exclusively by narrate_node_result to announce node completions and loop progress.
     if not text or not text.strip():
+        return
+    if not is_audio_enabled():
+        print(f"[progress] {text}")
         return
     generate_TTS_audio(
         text=text,

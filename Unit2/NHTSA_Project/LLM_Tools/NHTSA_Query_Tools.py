@@ -45,6 +45,7 @@ from LangGraph.config import mercury_llm
 # Import audio pipeline — TTS for Ask_User, STT for User_Answer
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent.parent))
+from Project_Tools.Runtime_Options import is_audio_enabled
 
 # ---------------------------------------------------------------------------
 # File path constants
@@ -538,7 +539,13 @@ def Ask_User(question: str) -> str:
     str
         Confirmation that the question was asked. Call User_Answer() next.
     """
-    # Speak the question aloud via TTS so the user hears it through their speakers.
+    # In audio mode, speak the question aloud via TTS so the user hears it through
+    # their speakers. In text mode, print the same question and let stdin carry
+    # the follow-up response through User_Answer().
+    if not is_audio_enabled():
+        print(f"[Ask_User] {question}")
+        return "Question asked in text mode. Call User_Answer() to retrieve the response."
+
     try:
         from Project_Tools.Audio_Playback import generate_TTS_audio
 
@@ -572,8 +579,12 @@ def User_Answer() -> str:
     str
         The user's plain-text response.
     """
-    # Capture the user's spoken reply, transcribe it via Whisper, and return
-    # the transcript string. Blocks until end-of-speech is detected.
+    # Capture the user's spoken reply in audio mode, or collect a typed reply in
+    # text mode. Both branches return a plain-text string so the calling node
+    # does not need mode-specific logic.
+    if not is_audio_enabled():
+        return input("Your response: ").strip()
+
     try:
         from Project_Tools.Audio_Capture import capture_and_transcribe
 

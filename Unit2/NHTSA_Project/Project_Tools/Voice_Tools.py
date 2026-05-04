@@ -32,6 +32,7 @@ ThreadPoolExecutor (standard LangGraph tool-execution pattern).
 import sys
 from pathlib import Path
 from langchain_core.tools import tool
+from Project_Tools.Runtime_Options import is_audio_enabled
 
 # ---------------------------------------------------------------------------
 # Path wiring — Audio_Playback and Audio_Capture live in the same directory
@@ -66,6 +67,13 @@ def voice_ask_user(question: str) -> str:
         The Whisper transcript of the user's spoken reply, or an error string
         starting with '[voice tool error:' if audio I/O fails.
     """
+    if not is_audio_enabled():
+        # Keep the tool contract identical in text mode: the LLM still calls the
+        # same tool name, but the interaction shifts to plain terminal I/O so the
+        # graph can run without the optional speech stack.
+        print(f"[voice_ask_user] {question}")
+        return input("Your response: ").strip()
+
     try:
         from Project_Tools.Audio_Playback import generate_TTS_audio
         from Project_Tools.Audio_Capture import capture_and_transcribe

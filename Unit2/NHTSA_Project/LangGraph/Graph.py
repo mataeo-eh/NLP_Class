@@ -1,3 +1,4 @@
+import argparse
 import json
 from langchain_core.messages import HumanMessage
 from langgraph.graph import StateGraph, START, END
@@ -13,6 +14,7 @@ from Nodes import (
 from State import State
 from Edges import route_by_task_type, route_after_retrieve, route_agentic_subtype
 from config import mercury_llm
+from Project_Tools.Runtime_Options import set_audio_enabled
 
 
 def json_to_spoken_text(data: dict | str) -> str:
@@ -39,6 +41,29 @@ def json_to_spoken_text(data: dict | str) -> str:
 
     response = mercury_llm.invoke([HumanMessage(content=prompt)])
     return response.content
+
+
+def parse_cli_args() -> argparse.Namespace:
+    """
+    Parse CLI flags for the LangGraph entrypoint.
+
+    Python's argparse documentation defines `action="store_true"` as the
+    standard way to model an on/off flag: the parsed attribute is False when
+    the flag is absent and True when the flag is present.
+    """
+    parser = argparse.ArgumentParser(
+        description="Run the NHTSA LangGraph complaint-analysis pipeline.",
+    )
+    parser.add_argument(
+        "-a",
+        "--audio",
+        action="store_true",
+        help=(
+            "Enable the existing speech pipeline so the run uses microphone "
+            "input and spoken output instead of plain text I/O."
+        ),
+    )
+    return parser.parse_args()
 
 
 graph = StateGraph(State)
@@ -106,20 +131,34 @@ graph.add_conditional_edges(
 app = graph.compile()
 
 
+def main() -> None:
+    """
+    Run the LangGraph pipeline in either audio mode or text mode.
 
+    The CLI flag is the single source of truth for whether the process should
+    activate STT/TTS. If the user requested audio but optional audio imports
+    fail, we immediately downgrade the shared runtime mode to text so every
+    downstream tool follows the same fallback behavior.
+    """
+    args = parse_cli_args()
+    requested_audio = args.audio
+    audio_available = False
+    generate_TTS_audio = None
+    capture_and_transcribe = None
 
+    if requested_audio:
+        try:
+            from Project_Tools.Audio_Playback import generate_TTS_audio
+            from Project_Tools.Audio_Capture import capture_and_transcribe
+            audio_available = True
+        except Exception as exc:
+            print(f"[Graph] Audio requested but unavailable; using text input/output. Reason: {exc}")
+    else:
+        print("[Graph] Audio disabled via CLI; using text input/output.")
 
-
-if __name__ == "__main__":
-    try:
-        from Project_Tools.Audio_Playback import generate_TTS_audio
-        from Project_Tools.Audio_Capture import capture_and_transcribe
-        audio_available = True
-    except Exception as exc:
-        print(f"[Graph] Audio unavailable; using text input/output. Reason: {exc}")
-        generate_TTS_audio = None
-        capture_and_transcribe = None
-        audio_available = False
+    # Publish the effective mode once so every downstream node/tool uses the
+    # same interaction style for this run.
+    set_audio_enabled(audio_available)
 
     # Greet the user via TTS so they know the system is ready, then capture their
     # spoken request and transcribe it before handing off to the graph.
@@ -138,18 +177,18 @@ if __name__ == "__main__":
         user_request = capture_and_transcribe()
     else:
         user_request = input("What are you looking for today? ").strip()
-    
+
     result = app.invoke({
-    "user_request": user_request,
-    "task_type": "",
-    "query_result": [],          # list[dict] — populated by retrieve_data
-    "reasoning_output": "",
-    "analysis": [],              # list[dict] — populated by analyze (per-row results)
-    "analysis_prompt_name": "",  # str — populated by analyze, consumed by csv_append
-    "response": "",
-    "agentic_subtype": "",       # str — set by classify_agentic_subtype; empty until then
-    "iteration_log": [],         # list[dict] — appended by agentic nodes each iteration
-})
+        "user_request": user_request,
+        "task_type": "",
+        "query_result": [],          # list[dict] — populated by retrieve_data
+        "reasoning_output": "",
+        "analysis": [],              # list[dict] — populated by analyze (per-row results)
+        "analysis_prompt_name": "",  # str — populated by analyze, consumed by csv_append
+        "response": "",
+        "agentic_subtype": "",       # str — set by classify_agentic_subtype; empty until then
+        "iteration_log": [],         # list[dict] — appended by agentic nodes each iteration
+    })
 
     spoken_response = json_to_spoken_text(result["response"])
     if audio_available:
@@ -160,7 +199,7 @@ if __name__ == "__main__":
             speed=0.85,
             lang_code="a",
             play=True,
-            streaming_interval = 0.2,
+            streaming_interval=0.2,
             # stream=True prevents the library from writing audio to disk.
             # Without it, generate_audio always calls audio_write() regardless of play=True.
             # save defaults to False, so audio is only queued to AudioPlayer, never persisted.
@@ -169,3 +208,7 @@ if __name__ == "__main__":
         )
     else:
         print(spoken_response)
+
+
+if __name__ == "__main__":
+    main()
