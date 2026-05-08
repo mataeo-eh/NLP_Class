@@ -6,3 +6,4 @@ frontend/.vercel/
 frontend/node_modules/
 backend/.vercel/
 backend/__pycache__/
+backend/**/__pycache__/

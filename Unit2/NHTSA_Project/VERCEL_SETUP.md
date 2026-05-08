@@ -1,25 +1,22 @@
-# NHTSA Project Vercel Skeleton
+# NHTSA Project Deployment Skeleton
 
-This repository slice is set up so `frontend` and `backend` can be connected to Vercel as two separate projects from the same Git repository.
+This repository slice is set up so the frontend can deploy on Vercel while the
+backend can deploy on a more traditional Python host such as Render.
 
-## Recommended Vercel dashboard setup
+## Recommended hosting split
 
-Create two Vercel projects that both point at this repository:
-
-1. Frontend project
+1. Frontend on Vercel
    Root Directory: `Unit2/NHTSA_Project/frontend`
-2. Backend project
+2. Backend on Render or a similar Python web-service host
    Root Directory: `Unit2/NHTSA_Project/backend`
-
-Once both projects are connected, pushes to `main` will trigger deployments for both Vercel projects.
 
 ## What exists today
 
-- `frontend` is a minimal Next.js placeholder app.
-- `backend` is a minimal Vercel Python function placeholder.
+- `frontend` is a minimal Next.js placeholder app for Vercel.
+- `backend` is a minimal FastAPI placeholder app for a standard ASGI host.
 - Neither side contains real product logic yet.
 
 ## Team handoff intent
 
 - Frontend teammates can replace the placeholder Next.js page and expand the app normally.
-- Backend teammates can replace the placeholder Python function with the real API implementation when they are ready.
+- Backend teammates can expand the FastAPI skeleton into the real API service when they are ready.
