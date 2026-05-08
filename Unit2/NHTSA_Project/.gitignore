@@ -4,6 +4,7 @@ CLAUDE.md
 frontend/.next/
 frontend/.vercel/
 frontend/node_modules/
+frontend/.env.local
 backend/.vercel/
 backend/__pycache__/
 backend/**/__pycache__/
