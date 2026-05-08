@@ -1,2 +1,8 @@
 CLAUDE.md
 .env
+.env.example
+frontend/.next/
+frontend/.vercel/
+frontend/node_modules/
+backend/.vercel/
+backend/__pycache__/
