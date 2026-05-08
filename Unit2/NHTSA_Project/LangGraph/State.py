@@ -48,6 +48,26 @@ class State(TypedDict):
     #               agentic sub-graph node.
     agentic_subtype: str
 
+    # User confirmation gate between the analyze node and csv_append. The
+    # confirm_csv_write node sets this flag to True when the user explicitly
+    # approves writing analysis results to disk, and False otherwise (including
+    # ambiguous replies, no rows to write, or the user saying "no"). The
+    # conditional edge route_csv_confirmation reads this flag to decide whether
+    # to route into csv_append or skip straight to END.
+    #
+    # Why this exists:
+    #   The pipeline must run safely in two very different deployment modes:
+    #     - Local interactive mode: the agent has filesystem write access and the
+    #       user wants analysis results persisted to the per-prompt CSVs.
+    #     - Hosted / read-only mode: the agent is forbidden from writing files,
+    #       so the user always answers "no" and csv_append is bypassed.
+    #   Routing on this boolean keeps the same graph definition usable in both
+    #   modes — the only thing that changes is the user's spoken answer.
+    #
+    # Populated by: confirm_csv_write (Nodes.py).
+    # Consumed by:  route_csv_confirmation (Edges.py).
+    csv_write_confirmed: bool
+
     # Accumulator of per-iteration metadata for the agentic loop. Each entry is
     # appended by the agentic loop node at the end of one reasoning iteration.
     # Shape of each entry:

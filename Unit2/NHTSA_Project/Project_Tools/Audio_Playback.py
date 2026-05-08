@@ -3,14 +3,20 @@ import sys
 import wave
 import datetime as _dt
 from dotenv import load_dotenv
-from Project_Tools.Runtime_Options import is_audio_enabled, get_voice_model
+from Project_Tools.Runtime_Options import (
+    is_audio_enabled,
+    get_voice_model,
+    get_voice_preset,
+)
 
 load_dotenv()
 
-# Pre-load the Kokoro model once at module import time so it sits in memory
-# and is reused across all generate_TTS_audio calls. Loading takes several
-# seconds; doing it here means the first TTS call has no cold-start penalty.
-# lazy=False forces all weights into memory immediately rather than on first use.
+# Concrete kokoro model path. This constant is the ONLY place in the project
+# where the kokoro model id appears — callers select kokoro via the CLI
+# selector key "kokoro" (see Runtime_Options.set_voice_model) and the kokoro
+# branch of generate_TTS_audio reads this constant via _get_tts_model().
+# Pre-loading the weights once at module import time means the first TTS call
+# has no cold-start penalty (load_model takes several seconds with lazy=False).
 _DEFAULT_MODEL_PATH = "mlx-community/Kokoro-82M-bf16"
 _tts_model = None
 _tts_import_error = None
@@ -441,8 +447,6 @@ def generate_TTS_audio(
     text="A VLM is an LLM whose input sequence has been extended to include image \
         patches that have been projected into the LLM's embedding space, \
         so attention treats vision and language as one unified token stream.",
-    model=_DEFAULT_MODEL_PATH,
-    voice="af_sky",
     speed=0.95,
     lang_code="a",
     streaming_interval = 0.5,
@@ -456,63 +460,89 @@ def generate_TTS_audio(
     save=False,
     save_path=None,
 ):
+    # NOTE: this function intentionally does NOT accept `model=` or `voice=`
+    # parameters. Both are chosen process-wide by the LangGraph CLI:
+    #   - --voice-model picks the engine (deepgram / cartesia / kokoro), read
+    #     here via get_voice_model().
+    #   - --voice-preset picks the engine-specific voice (read via
+    #     get_voice_preset()) and is routed below to the correct underlying
+    #     parameter for the selected engine — voice= for kokoro, voice_id=
+    #     for cartesia, model_id= for deepgram (deepgram bakes voice and
+    #     language into its model id).
+    # Removing both arguments prevents any caller upstream from pinning the
+    # pipeline to a specific TTS model OR a voice that the active engine does
+    # not support. Every TTS step in the run uses the same engine + preset
+    # the user selected on the CLI.
     if not text or not text.strip():
         raise ValueError("generate_TTS_audio received empty text — nothing to synthesize.")
 
     # Dispatch on the process-wide voice-model selector set by the LangGraph
-    # CLI. Cartesia is intentionally treated as a separate engine — it does
-    # NOT consume the Kokoro-shaped `model`/`voice`/`lang_code`/
-    # `streaming_interval`/`stream` parameters because Cartesia's HTTP
-    # streaming endpoint handles all of those concerns natively. Any caller
-    # passing those parameters will simply have them ignored when Cartesia is
-    # selected; that is intentional so existing callers (narrate_progress,
-    # voice_ask_user, Graph.py greeting/response, NHTSA_Query_Tools.Ask_User)
-    # do not need to be edited when the user flips the CLI flag.
+    # CLI. The Cartesia and Deepgram branches do NOT consume the Kokoro-shaped
+    # `lang_code` / `streaming_interval` / `stream` parameters because their
+    # HTTP streaming endpoints handle those concerns natively (Deepgram bakes
+    # language into the model id, Cartesia hardcodes language="en" in the
+    # request body). Callers can keep passing the kokoro-shaped kwargs
+    # uniformly — they're simply ignored on the cloud-TTS branches.
     selected = get_voice_model()
+    # The runtime preset is engine-specific. Validation in
+    # Runtime_Options.set_voice_preset guarantees the preset belongs to the
+    # active engine's allowlist, so each branch can route it directly to the
+    # right underlying parameter without re-validating.
+    preset = get_voice_preset()
     if selected == "cartesia":
         # Cartesia accepts speed as a float multiplier; the Kokoro path uses
         # values like 0.85/0.95/1.1. Pass the same speed straight through —
         # Cartesia's `generation_config.speed` is in the same shape (1.0 == real-time).
         # Guard against zero/negative values that would be invalid in either system.
         cartesia_speed = speed if isinstance(speed, (int, float)) and speed > 0 else 1.0
+        # The Cartesia preset is the voice UUID (passed as `voice.id` in the
+        # request body). model_id stays at the per-engine default constant.
         _generate_cartesia_audio(
             text=text,
             speed=float(cartesia_speed),
             play=bool(play),
             save=bool(save),
             save_path=save_path,
+            voice_id=preset,
         )
         return
     if selected == "deepgram":
         # Deepgram's `audio.generate` accepts `speed` (same shape as
-        # Cartesia's), so we forward it. The Kokoro-shaped `voice`/
-        # `lang_code`/`streaming_interval`/`stream`/`model` arguments are
-        # intentionally ignored — Deepgram exposes voice and language via
-        # the model id (e.g. `aura-2-hyperion-en`) and handles streaming
-        # natively. The dispatch keeps the Kokoro signature stable so
-        # existing callers (narrate_progress, voice_ask_user, Graph.py
-        # greeting/response, NHTSA_Query_Tools.Ask_User) need no edits.
+        # Cartesia's), so we forward it. The Kokoro-shaped `lang_code` /
+        # `streaming_interval` / `stream` arguments are intentionally ignored —
+        # Deepgram exposes voice and language via the model id (e.g.
+        # `aura-2-hyperion-en`) and handles streaming natively. The dispatch
+        # keeps the Kokoro signature stable so existing callers
+        # (narrate_progress, voice_ask_user, Graph.py greeting/response,
+        # NHTSA_Query_Tools.Ask_User) need no edits.
         deepgram_speed = speed if isinstance(speed, (int, float)) and speed > 0 else 1.0
+        # For Deepgram the "voice preset" IS the model id — Deepgram bakes
+        # voice and language together into a single id like
+        # "aura-2-hyperion-en", so we route the runtime preset straight to
+        # _generate_deepgram_audio's model_id parameter.
         _generate_deepgram_audio(
             text=text,
             speed=float(deepgram_speed),
             play=bool(play),
             save=bool(save),
             save_path=save_path,
+            model_id=preset,
         )
         return
 
-    # Default Kokoro path — unchanged behavior from the original implementation.
-    # If the caller requests the default model, pass the pre-loaded instance to
-    # skip load_model() inside generate_audio. If a different model path is given,
-    # fall back to the string so generate_audio loads it fresh.
-    model_arg = _get_tts_model() if model == _DEFAULT_MODEL_PATH else model
+    # Default Kokoro path. The concrete kokoro model path lives in
+    # _DEFAULT_MODEL_PATH and is consumed exclusively by _get_tts_model() —
+    # callers never pass a path in. Reusing the pre-loaded instance skips
+    # load_model() inside generate_audio so there is no per-call cold start.
+    model_arg = _get_tts_model()
 
+    # The kokoro preset is a voice name (e.g. "af_sky") routed directly to
+    # mlx_audio.generate_audio's `voice=` parameter.
     generate_audio(
         text=text,
         model=model_arg,
         streaming_interval = streaming_interval,
-        voice=voice,
+        voice=preset,
         speed=speed,
         lang_code=lang_code,
         play=play,
@@ -524,8 +554,13 @@ def generate_TTS_audio(
 def narrate_progress(text: str) -> None:
     # Faster-paced TTS for progress updates — speed 1.1 vs the default 0.95, and a
     # slightly larger streaming buffer (0.7s) for smoother pacing on short status phrases.
-    # Same voice and model as the main TTS for session-wide consistency.
     # Used exclusively by narrate_node_result to announce node completions and loop progress.
+    #
+    # Neither `model=` nor `voice=` is passed: generate_TTS_audio routes to the
+    # engine + preset the user selected on the CLI (--voice-model and
+    # --voice-preset). Both are owned by Runtime_Options / Audio_Playback and
+    # are uniform across every TTS step in the run, so progress updates always
+    # speak with the same voice as the rest of the pipeline.
     if not text or not text.strip():
         return
     if not is_audio_enabled():
@@ -533,8 +568,6 @@ def narrate_progress(text: str) -> None:
         return
     generate_TTS_audio(
         text=text,
-        model=_DEFAULT_MODEL_PATH,
-        voice="af_sky",
         speed=1.1,
         streaming_interval=0.7,
         play=True,

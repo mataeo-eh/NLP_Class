@@ -28,6 +28,30 @@ def route_after_retrieve(state: State) -> str:
         return "END"
 
 
+def route_csv_confirmation(state: State) -> str:
+    # WHY this function exists:
+    #   The graph used to wire analyze straight into csv_append, which forced a
+    #   filesystem write at the end of every analyze run. That breaks any hosted
+    #   deployment where the agent has no write permission. The confirm_csv_write
+    #   node now sits between analyze and csv_append and asks the user explicitly
+    #   whether to commit results to disk — this edge reads the resulting boolean
+    #   and fans out accordingly.
+    #
+    # Routing contract:
+    #   True  -> "csv_append"  (user approved the write; proceed as before)
+    #   False -> "END"         (user declined, ambiguous reply, or nothing to
+    #                            write; skip the filesystem and end the run)
+    #
+    # No deterministic-fallback warning is needed here: confirm_csv_write always
+    # writes a bool, so this edge always has a clean decision to return.
+    #
+    # Populated by: confirm_csv_write (Nodes.py) sets state["csv_write_confirmed"]
+    # Consumed by:  LangGraph conditional edge attached to confirm_csv_write
+    if state.get("csv_write_confirmed", False):
+        return "csv_append"
+    return "END"
+
+
 def route_agentic_subtype(state: State) -> str:
     # WHY this function exists:
     #   After classify_agentic_subtype runs, the graph needs to fan out to one

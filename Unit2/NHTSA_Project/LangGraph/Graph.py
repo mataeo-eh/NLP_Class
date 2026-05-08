@@ -7,21 +7,52 @@ from Nodes import (
     classify_agentic_subtype,  # NEW: classifies agentic sub-intent after task_type is set
     retrieve_data,
     analyze,
+    confirm_csv_write,         # NEW: user yes/no gate before any CSV mutation
     csv_append,
     agentic_analyze,           # NEW: targeted agentic analysis path
     agentic_explore,           # NEW: open-ended agentic exploration path
 )
 from State import State
-from Edges import route_by_task_type, route_after_retrieve, route_agentic_subtype
+from Edges import (
+    route_by_task_type,
+    route_after_retrieve,
+    route_csv_confirmation,    # NEW: routes confirm_csv_write to csv_append or END
+    route_agentic_subtype,
+)
 from config import mercury_llm
-from Project_Tools.Runtime_Options import set_audio_enabled, set_voice_model
+from Project_Tools.Runtime_Options import (
+    set_audio_enabled,
+    set_voice_model,
+    set_voice_preset,
+    get_default_voice_preset,
+    get_allowed_voice_presets,
+)
 
 
 '''
 To run with CLI flags run the command below
+python Unit2/NHTSA_Project/LangGraph/Graph.py -a -v deepgram
+or
 python Unit2/NHTSA_Project/LangGraph/Graph.py -a -v cartesia
 or
-python Unit2/NHTSA_Project/LangGraph/Graph.py -a -v deepgram
+python Unit2/NHTSA_Project/LangGraph/Graph.py -a -v kokoro
+
+If --voice-model / -v is omitted, the pipeline defaults to "deepgram". The
+selected key is just a short selector — the concrete TTS model path / id for
+each engine is owned by Project_Tools/Audio_Playback.py and is never passed in
+by callers, so no step of the pipeline can pin itself to a specific TTS model.
+
+A voice preset can be selected with --voice-preset / -vp. The acceptable
+preset values DEPEND on the chosen --voice-model: each engine exposes a
+different concept of "voice" (kokoro voice name, cartesia voice UUID,
+deepgram model id), so presets are not interchangeable. The full registry
+lives in Project_Tools/Runtime_Options._ALLOWED_VOICE_PRESETS. If -vp is
+omitted, the per-engine default is used (af_sky for kokoro,
+6ccbfb76-1fc6-48f7-b71d-91ac6298247b for cartesia, aura-2-hyperion-en for
+deepgram). Passing a preset that is not in the allowlist for the chosen
+engine causes the CLI to exit with a clear error.
+
+Example: python Unit2/NHTSA_Project/LangGraph/Graph.py -a -v deepgram -vp aura-2-hyperion-en
 '''
 
 
@@ -74,28 +105,95 @@ def parse_cli_args() -> argparse.Namespace:
     )
     # --voice-model / -v selects which TTS engine drives every spoken response
     # in this run. `type=str.lower` is argparse's documented way to normalise
-    # the user's input before validation, so "Cartesia", "cartesia", and
-    # "CARTESIA" all map to the same canonical value. `choices=` then enforces
+    # the user's input before validation, so "Deepgram", "deepgram", and
+    # "DEEPGRAM" all map to the same canonical value. `choices=` then enforces
     # the closed set — any other spelling produces an immediate parser error.
+    #
+    # The CLI value is just a short selector key — the concrete model path /
+    # model id for each engine lives inside Project_Tools/Audio_Playback.py
+    # (one default constant per engine: _DEFAULT_MODEL_PATH for kokoro,
+    # _CARTESIA_DEFAULT_MODEL for cartesia, _DEEPGRAM_DEFAULT_MODEL for
+    # deepgram). No call site in the pipeline passes a TTS model path itself;
+    # they all rely on get_voice_model() dispatch in generate_TTS_audio.
     parser.add_argument(
         "-v",
         "--voice-model",
         type=str.lower,
         choices=("kokoro", "cartesia", "deepgram"),
-        default="kokoro",
+        default="deepgram",
         help=(
             "Which TTS engine to use for spoken output (case-insensitive). "
+            "Default is 'deepgram'. "
+            "'deepgram' uses the Deepgram aura-2 cloud TTS, which streams "
+            "audio chunks directly to the speakers as they are synthesised "
+            "(requires DEEPGRAM_TTS_KEY). "
+            "'cartesia' uses the Cartesia sonic-3.5 cloud TTS, which natively "
+            "streams audio bytes directly to the speakers — the per-sentence "
+            "batching pipeline is bypassed and the full transcript is sent in "
+            "one request (requires TTS_KEY). "
             "'kokoro' uses the local MLX Kokoro-82M-bf16 model with the "
-            "existing per-sentence batching pipeline. 'cartesia' uses the "
-            "Cartesia sonic-3.5 cloud TTS, which natively streams audio bytes "
-            "directly to the speakers — the batching pipeline is bypassed and "
-            "the full transcript is sent in one request (requires TTS_KEY). "
-            "'deepgram' uses the Deepgram aura-2 cloud TTS, which also "
-            "streams audio chunks directly to the speakers as they are "
-            "synthesised (requires DEEPGRAM_TTS_KEY)."
+            "per-sentence batching pipeline."
+        ),
+    )
+    # --voice-preset / -vp selects which voice preset of the chosen engine to
+    # use. argparse cannot express "the allowed choices for this flag depend on
+    # the value of another flag," so we accept any string here and validate
+    # against the per-engine allowlist post-parse (see _resolve_voice_preset
+    # below). Default is None — meaning "use the default preset for the
+    # selected engine," which is the same value that's currently wired in.
+    #
+    # Each engine exposes a different concept of "voice":
+    #   kokoro   — voice name (e.g. "af_sky") passed to mlx_audio.generate_audio.
+    #   cartesia — voice UUID passed as `voice.id` in the JSON body.
+    #   deepgram — model id (e.g. "aura-2-hyperion-en") that bakes voice
+    #              and language together.
+    # Presets are NOT interchangeable across engines — the registry in
+    # Runtime_Options enforces this with a per-engine allowlist.
+    parser.add_argument(
+        "-vp",
+        "--voice-preset",
+        type=str,
+        default=None,
+        help=(
+            "Voice preset to use with the selected --voice-model. The set of "
+            "allowed values depends on -v: kokoro accepts voice names "
+            "(e.g. 'af_sky'), cartesia accepts voice UUIDs, and deepgram "
+            "accepts model ids that bake voice and language together "
+            "(e.g. 'aura-2-hyperion-en'). When omitted, the default preset "
+            "for the selected engine is used. Currently only one preset is "
+            "wired in per engine; passing anything else raises a CLI error."
         ),
     )
     return parser.parse_args()
+
+
+def _resolve_voice_preset(model: str, preset: str | None) -> str:
+    """
+    Pick the final voice preset to use for this run.
+
+    `model` is the already-validated CLI --voice-model value. `preset` is the
+    raw --voice-preset argument (or None if the user omitted the flag). When
+    None, fall back to the per-engine default. When non-None, validate against
+    the engine's allowlist and exit with a clean error on mismatch — argparse
+    cannot do this validation natively because the allowed set depends on
+    another flag's value.
+    """
+    if preset is None:
+        return get_default_voice_preset(model)
+
+    allowed = get_allowed_voice_presets(model)
+    if preset not in allowed:
+        # Mirror argparse's own error UX: write to stderr and exit non-zero so
+        # CI / shell wrappers see a clear failure rather than a Python
+        # traceback.
+        import sys as _sys
+        _sys.stderr.write(
+            f"error: voice preset {preset!r} is not allowed for "
+            f"--voice-model {model!r}. Allowed presets: "
+            f"{', '.join(allowed)}.\n"
+        )
+        raise SystemExit(2)
+    return preset
 
 
 graph = StateGraph(State)
@@ -107,6 +205,12 @@ graph.add_node("classify_task", classify_task)
 graph.add_node("classify_agentic_subtype", classify_agentic_subtype)
 graph.add_node("retrieve_data", retrieve_data)
 graph.add_node("analyze", analyze)
+# confirm_csv_write speaks a Mercury-summary of the pending write via TTS, then
+# asks the user yes/no through voice_ask_user (or stdin in text mode). Its boolean
+# output drives the conditional edge below — this is what makes the CSV write
+# optional so the same graph runs locally (where writes are allowed) and in any
+# hosted environment where the agent must not touch the filesystem.
+graph.add_node("confirm_csv_write", confirm_csv_write)
 graph.add_node("csv_append", csv_append)
 # agentic_analyze: the user posed a specific question; agent retrieves targeted
 # data, reasons over it, and returns a structured analysis — mirrors the
@@ -117,10 +221,15 @@ graph.add_node("agentic_analyze", agentic_analyze)
 graph.add_node("agentic_explore", agentic_explore)
 
 graph.add_edge(START, "classify_task")   # entry point
-# After analysis, persist each per-row result to the prompt's CSV before exit.
+# After analysis, hand off to the user-confirmation gate instead of writing
+# directly to disk. confirm_csv_write narrates a Mercury+TTS summary of what's
+# queued, asks the user yes/no, and stores the answer in state so the
+# conditional edge below can decide whether to actually call csv_append.
+graph.add_edge("analyze", "confirm_csv_write")
 # csv_append handles dedup against existing df_index values, so re-running
-# analysis on a previously analyzed complaint never produces a duplicate row.
-graph.add_edge("analyze", "csv_append")
+# analysis on a previously analyzed complaint never produces a duplicate row —
+# but it only runs when the user has explicitly approved the write via the
+# confirm_csv_write gate above.
 graph.add_edge("csv_append", END)
 # Both agentic sub-nodes are terminal — they produce their own response and
 # write iteration_log; no further graph nodes need to run after them.
@@ -147,6 +256,21 @@ graph.add_conditional_edges(
     {
         "analyze": "analyze",
         "END":     END,
+    }
+)
+
+# After confirm_csv_write asks the user yes/no, route based on the recorded answer.
+# This is the gate that decouples analysis from filesystem writes: when the user
+# says yes, the graph proceeds into csv_append exactly like before; when the user
+# says no (or the reply is ambiguous, or there's nothing to write), the graph
+# exits without touching disk. That makes the same compiled graph safe to run
+# both locally (writes allowed) and in any hosted setting (writes forbidden).
+graph.add_conditional_edges(
+    "confirm_csv_write",
+    route_csv_confirmation,
+    {
+        "csv_append": "csv_append",
+        "END":        END,
     }
 )
 
@@ -192,23 +316,39 @@ def main() -> None:
     # same interaction style for this run.
     set_audio_enabled(audio_available)
     # Publish the voice-model selector before any TTS call happens. argparse
-    # has already normalised the value to lowercase ("kokoro" or "cartesia")
-    # via type=str.lower + choices, so set_voice_model receives a valid input.
-    # Doing this even when audio_available is False is harmless — the selector
-    # is only read inside generate_TTS_audio, which never runs in text mode —
-    # and it keeps the runtime state consistent with what the user requested
-    # in case audio is re-enabled later in the process.
+    # has already normalised the value to lowercase ("deepgram", "cartesia",
+    # or "kokoro") via type=str.lower + choices, so set_voice_model receives a
+    # valid input. Doing this even when audio_available is False is harmless —
+    # the selector is only read inside generate_TTS_audio, which never runs in
+    # text mode — and it keeps the runtime state consistent with what the user
+    # requested in case audio is re-enabled later in the process.
     set_voice_model(args.voice_model)
+    # Resolve and publish the voice preset for the chosen engine. Order matters:
+    # set_voice_model() must run FIRST because set_voice_preset() validates the
+    # supplied preset against the allowlist for the currently selected model.
+    # _resolve_voice_preset substitutes the per-engine default when -vp was
+    # omitted and exits with a clean CLI error when the user passed a preset
+    # that is not allowed for the chosen engine.
+    resolved_preset = _resolve_voice_preset(args.voice_model, args.voice_preset)
+    set_voice_preset(resolved_preset)
     if audio_available:
-        print(f"[Graph] Using voice model: {args.voice_model}")
+        print(
+            f"[Graph] Using voice model: {args.voice_model} "
+            f"(preset: {resolved_preset})"
+        )
 
     # Greet the user via TTS so they know the system is ready, then capture their
     # spoken request and transcribe it before handing off to the graph.
+    #
+    # Neither `model=` nor `voice=` is passed here — generate_TTS_audio reads
+    # both from the runtime selectors set above (set_voice_model and
+    # set_voice_preset) and dispatches to the right engine internally. The
+    # kokoro-shaped lang_code / streaming_interval / stream arguments are
+    # only read by the kokoro branch and ignored by cartesia / deepgram,
+    # which encode language in their model id and stream natively.
     if audio_available:
         generate_TTS_audio(
-            text="Hey, welcome back. What are you looking for today?",
-            model="mlx-community/Kokoro-82M-bf16",
-            voice="af_sky",
+            text="Welcome back! What NHTSA adventure shall we embark on?",
             speed=0.85,
             lang_code="a",
             play=True,
@@ -228,16 +368,18 @@ def main() -> None:
         "analysis": [],              # list[dict] — populated by analyze (per-row results)
         "analysis_prompt_name": "",  # str — populated by analyze, consumed by csv_append
         "response": "",
+        "csv_write_confirmed": False, # bool — set by confirm_csv_write based on user yes/no
         "agentic_subtype": "",       # str — set by classify_agentic_subtype; empty until then
         "iteration_log": [],         # list[dict] — appended by agentic nodes each iteration
     })
 
     spoken_response = json_to_spoken_text(result["response"])
     if audio_available:
+        # Same dispatch contract as the greeting call above — neither `model=`
+        # nor `voice=` is passed. generate_TTS_audio reads both from the
+        # runtime selectors and routes to the engine the user picked on the CLI.
         generate_TTS_audio(
             text=spoken_response,
-            model="mlx-community/Kokoro-82M-bf16",
-            voice="af_sky",
             speed=0.85,
             lang_code="a",
             play=True,

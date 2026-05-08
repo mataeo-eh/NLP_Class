@@ -549,10 +549,15 @@ def Ask_User(question: str) -> str:
     try:
         from Project_Tools.Audio_Playback import generate_TTS_audio
 
+        # Neither `model=` nor `voice=` is passed: generate_TTS_audio
+        # dispatches on the runtime voice-model selector and voice-preset set
+        # at CLI parse time (--voice-model and --voice-preset). Each engine's
+        # branch routes the runtime preset to the right underlying parameter
+        # (kokoro voice=, cartesia voice_id=, deepgram model_id=). The
+        # kokoro-shaped lang_code / streaming_interval / stream args are read
+        # only on the kokoro branch and silently ignored on cartesia / deepgram.
         generate_TTS_audio(
             text=question,
-            model="mlx-community/Kokoro-82M-bf16",
-            voice="af_sky",
             speed=0.85,
             lang_code="a",
             play=True,

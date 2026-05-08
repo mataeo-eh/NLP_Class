@@ -396,6 +396,113 @@ Any response that contains anything other than one of those exact strings is wro
 OUTPUTS_DIR = str(Path(__file__).resolve().parent.parent / "Outputs")
 
 
+def confirm_csv_write(state: State) -> dict:
+    """
+    User-confirmation gate that sits between the analyze node and csv_append.
+
+    Runtime contract
+    ----------------
+      - Reads:  state["analysis"], state["analysis_prompt_name"]
+      - Writes: state["csv_write_confirmed"] (bool)
+      - Side effects: one Mercury+TTS narration call (via narrate_node_result)
+        plus one voice_ask_user call (TTS prompt + STT capture in audio mode,
+        or print + input() in text mode).
+
+    Why this node exists
+    --------------------
+    Originally analyze routed straight into csv_append, which meant the pipeline
+    always wrote analysis results to disk. That's correct for local interactive
+    runs, but breaks the moment the pipeline is hosted somewhere the agent has
+    no filesystem write permission. Inserting an explicit yes/no gate means the
+    same graph runs safely in both deployment modes — the user is the source of
+    truth for "should we touch disk?" and answering "no" simply skips csv_append.
+
+    Behaviour
+    ---------
+      1. If there are no analysis rows, or no prompt name was selected, there is
+         nothing to commit. Short-circuit to "not confirmed" and skip the spoken
+         question entirely — asking "save these zero results?" would be a poor UX.
+      2. Use narrate_node_result (Mercury + TTS) to summarise what is queued for
+         write. This is the same inter-chain reasoning narration channel every
+         other node uses, so the user hears one consistent voice across the run.
+      3. Ask the user a literal yes/no question via voice_ask_user. That tool
+         already handles audio-vs-text mode internally — in audio mode it speaks
+         the question and returns a Whisper transcript; in text mode it prints
+         and reads stdin — so this node does not need to branch on audio mode.
+      4. Parse the reply with simple keyword matching against canonical yes/no
+         tokens. The user has been instructed to answer "yes" or "no", and the
+         project explicitly tolerates the user being trusted to comply. Any
+         reply that matches neither token set is treated as "no" because not
+         writing is the safer default.
+    """
+    analysis = state["analysis"]
+    prompt_name = state.get("analysis_prompt_name", "")
+
+    # Nothing to commit -> skip the prompt entirely. csv_append already no-ops
+    # in this case, but we'd rather not subject the user to a spoken question
+    # about a write that wouldn't happen anyway.
+    if not analysis or not prompt_name:
+        print("[confirm_csv_write] Nothing to write; skipping confirmation prompt.")
+        return {"csv_write_confirmed": False}
+
+    # Mercury+TTS narration of the pending write. narrate_node_result feeds
+    # the context dict into Node_Progress_Summary_Prompt, which Mercury formats
+    # into 2-4 sentences of TTS-safe prose. This gives the user spoken context
+    # about what is queued before they have to make the yes/no decision.
+    narrate_node_result("confirm_csv_write", {
+        "analysis_prompt_name": prompt_name,
+        "row_count": len(analysis),
+        "destination_csv": f"Outputs/{prompt_name}.csv",
+        "next_step_if_yes": "write rows to CSV via csv_append",
+        "next_step_if_no":  "skip the write and end the run",
+    })
+
+    # Explicit yes/no question. voice_ask_user.invoke is the LangChain @tool
+    # contract — same one used by the agentic nodes — so audio-mode TTS+STT
+    # vs text-mode stdin handling is encapsulated inside the tool.
+    question = (
+        f"I have {len(analysis)} analysis result"
+        f"{'s' if len(analysis) != 1 else ''} ready to write to the "
+        f"{prompt_name} CSV file. Would you like me to save them? "
+        "Please answer yes or no."
+    )
+    raw_reply = voice_ask_user.invoke({"question": question})
+
+    # Lightweight token-matching yes/no parser. The user was asked to answer
+    # literally "yes" or "no", but we accept a short list of common natural
+    # variants on each side so the dialogue feels less rigid. Order matters:
+    # checking yes_tokens first means a hypothetical reply like "yes, don't
+    # bother" would be treated as a yes, but the user has been instructed to
+    # answer cleanly and we tolerate that assumption per the project decision.
+    reply_lower = raw_reply.strip().lower() if isinstance(raw_reply, str) else ""
+    yes_tokens = ("yes", "yeah", "yep", "yup", "sure", "affirmative",
+                  "go ahead", "do it", "save them", "save it", "please")
+    no_tokens  = ("no", "nope", "nah", "negative", "don't", "do not",
+                  "skip", "cancel", "stop")
+
+    if any(tok in reply_lower for tok in yes_tokens):
+        confirmed = True
+    elif any(tok in reply_lower for tok in no_tokens):
+        confirmed = False
+    else:
+        # Ambiguous or empty reply -> default to NOT writing. The user can
+        # re-run the pipeline if they actually wanted the write to happen;
+        # there's no equivalent way to undo an unwanted CSV mutation.
+        print(f"[confirm_csv_write] Ambiguous reply {raw_reply!r}; "
+              f"defaulting to skip CSV write.")
+        confirmed = False
+
+    # Narrate the decision so the user hears confirmation that the system
+    # understood their answer, before the graph routes to csv_append or END.
+    narrate_node_result("confirm_csv_write_decision", {
+        "decision": "writing to CSV" if confirmed else "skipping CSV write",
+        "analysis_prompt_name": prompt_name,
+        "row_count": len(analysis),
+    })
+
+    return {"csv_write_confirmed": confirmed}
+
+
 def csv_append(state: State) -> dict:
     """
     Append per-row analysis results to the CSV that matches the chosen prompt.
