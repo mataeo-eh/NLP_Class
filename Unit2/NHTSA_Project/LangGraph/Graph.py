@@ -14,7 +14,16 @@ from Nodes import (
 from State import State
 from Edges import route_by_task_type, route_after_retrieve, route_agentic_subtype
 from config import mercury_llm
-from Project_Tools.Runtime_Options import set_audio_enabled
+from Project_Tools.Runtime_Options import set_audio_enabled, set_voice_model
+
+
+'''
+To run with CLI flags run the command below
+python Unit2/NHTSA_Project/LangGraph/Graph.py -a -v cartesia
+or
+python Unit2/NHTSA_Project/LangGraph/Graph.py -a -v deepgram
+'''
+
 
 
 def json_to_spoken_text(data: dict | str) -> str:
@@ -61,6 +70,29 @@ def parse_cli_args() -> argparse.Namespace:
         help=(
             "Enable the existing speech pipeline so the run uses microphone "
             "input and spoken output instead of plain text I/O."
+        ),
+    )
+    # --voice-model / -v selects which TTS engine drives every spoken response
+    # in this run. `type=str.lower` is argparse's documented way to normalise
+    # the user's input before validation, so "Cartesia", "cartesia", and
+    # "CARTESIA" all map to the same canonical value. `choices=` then enforces
+    # the closed set — any other spelling produces an immediate parser error.
+    parser.add_argument(
+        "-v",
+        "--voice-model",
+        type=str.lower,
+        choices=("kokoro", "cartesia", "deepgram"),
+        default="kokoro",
+        help=(
+            "Which TTS engine to use for spoken output (case-insensitive). "
+            "'kokoro' uses the local MLX Kokoro-82M-bf16 model with the "
+            "existing per-sentence batching pipeline. 'cartesia' uses the "
+            "Cartesia sonic-3.5 cloud TTS, which natively streams audio bytes "
+            "directly to the speakers — the batching pipeline is bypassed and "
+            "the full transcript is sent in one request (requires TTS_KEY). "
+            "'deepgram' uses the Deepgram aura-2 cloud TTS, which also "
+            "streams audio chunks directly to the speakers as they are "
+            "synthesised (requires DEEPGRAM_TTS_KEY)."
         ),
     )
     return parser.parse_args()
@@ -159,6 +191,16 @@ def main() -> None:
     # Publish the effective mode once so every downstream node/tool uses the
     # same interaction style for this run.
     set_audio_enabled(audio_available)
+    # Publish the voice-model selector before any TTS call happens. argparse
+    # has already normalised the value to lowercase ("kokoro" or "cartesia")
+    # via type=str.lower + choices, so set_voice_model receives a valid input.
+    # Doing this even when audio_available is False is harmless — the selector
+    # is only read inside generate_TTS_audio, which never runs in text mode —
+    # and it keeps the runtime state consistent with what the user requested
+    # in case audio is re-enabled later in the process.
+    set_voice_model(args.voice_model)
+    if audio_available:
+        print(f"[Graph] Using voice model: {args.voice_model}")
 
     # Greet the user via TTS so they know the system is ready, then capture their
     # spoken request and transcribe it before handing off to the graph.
