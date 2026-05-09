@@ -1,2 +1,52 @@
+# NHTSA Project — Render backend dependencies
+#
+# Why this file is hand-curated (and not a `pip freeze` of the whole .venv311)
+# ---------------------------------------------------------------------------
+# The project's local virtualenv has dozens of macOS-only or notebook-only
+# packages (mlx-audio, sounddevice, torch, whisper, jupyter, etc.) that have
+# no business on a Linux web server and would either fail to install or bloat
+# the build. Render's free tier already cold-starts slowly; trimming the
+# install set keeps that responsive.
+#
+# Anything imported lazily (only inside a function body) by Voice_Tools,
+# Audio_Capture, or generate_TTS_audio is intentionally NOT in this list —
+# headless mode short-circuits those code paths before the import would run.
+
+# --- Web server -------------------------------------------------------------
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
+
+# --- LangGraph + LangChain stack -------------------------------------------
+# All three are imported at module load time by Graph.py / Nodes.py / config.py.
+langgraph>=1.0,<2.0
+langchain-core>=1.0,<2.0
+langchain-openai>=1.0,<2.0
+
+# --- Data layer -------------------------------------------------------------
+# pandas reads NHTSA/complaints_cleaned.parquet at request time. pyarrow is
+# pandas' parquet engine — pip won't pull it transitively, so it has to be
+# named here explicitly or pd.read_parquet() will raise ImportError.
+pandas>=2.0,<3.0
+pyarrow>=15.0
+numpy>=1.26,<3.0
+
+# --- Misc utilities ---------------------------------------------------------
+# python-dotenv: load_dotenv() is called from several modules. On Render the
+# real env vars are already injected before Python starts, so load_dotenv is
+# effectively a no-op there — but the import itself must still succeed.
+python-dotenv>=1.0
+# requests: used by Audio_Playback's Cartesia/Deepgram HTTP paths. Those paths
+# are gated by is_audio_enabled(), which is False on the backend, so requests
+# is *not* strictly required at runtime. It's kept here so the module imports
+# cleanly even if a future code change moves a `requests` import to module top.
+requests>=2.31
+
+# --- Charting (Chart_Tools.py imports matplotlib at module top) ------------
+# matplotlib is needed because Chart_Tools.py — which is in the agentic_explore
+# tool list and therefore in the import chain of LangGraph/Nodes.py — does
+# `import matplotlib` and `import matplotlib.pyplot as plt` unconditionally
+# at module load time. Even though no chart can render server-side (the
+# Preview-stdin / xdg-open code paths can't work on Render), the import
+# itself must still succeed. Headless = no display, so we rely on the Agg
+# backend that Chart_Tools sets explicitly before pyplot loads.
+matplotlib>=3.8,<4.0
