@@ -45,11 +45,6 @@ from pydantic import BaseModel, Field
 # logs rather than the first time a user hits /run.
 from pipeline_runner import encode_sse, stream_pipeline
 
-from dotenv import load_dotenv
-# ---------------------------------------------------------------------------
-# Load environment variables from a .env file
-# ---------------------------------------------------------------------------
-load_dotenv()
 
 
 # ---------------------------------------------------------------------------
