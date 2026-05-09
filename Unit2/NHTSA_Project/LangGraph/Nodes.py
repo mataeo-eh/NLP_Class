@@ -255,10 +255,19 @@ def retrieve_data(state: State) -> dict:
     else:
         query_result = last_data_rows
 
-    narrate_node_result("retrieve_data", {
-        "row_count": len(query_result),
-        "task_type": state.get("task_type", ""),
-    })
+    # Only narrate the retrieve_data progress summary when there is more graph
+    # work downstream (task_type == "analyze" routes into the analyze node).
+    # When task_type is "retrieve" (or anything else), route_after_retrieve sends
+    # the graph straight to END, and main() immediately runs json_to_spoken_text
+    # on state["response"] to produce the final TTS. Speaking a Mercury-summarised
+    # progress update here as well would just duplicate the same content the user
+    # is about to hear from the end-of-pipeline TTS step. Skipping the narration
+    # on the END path eliminates that "same output twice in a row" effect.
+    if task_type == "analyze":
+        narrate_node_result("retrieve_data", {
+            "row_count": len(query_result),
+            "task_type": state.get("task_type", ""),
+        })
 
     return {
         "query_result": query_result,
@@ -508,13 +517,20 @@ def confirm_csv_write(state: State) -> dict:
               f"defaulting to skip CSV write.")
         confirmed = False
 
-    # Narrate the decision so the user hears confirmation that the system
-    # understood their answer, before the graph routes to csv_append or END.
-    narrate_node_result("confirm_csv_write_decision", {
-        "decision": "writing to CSV" if confirmed else "skipping CSV write",
-        "analysis_prompt_name": prompt_name,
-        "row_count": len(analysis),
-    })
+    # Narrate the decision ONLY when the graph still has work to do downstream
+    # (confirmed == True routes into csv_append). When confirmed == False,
+    # route_csv_confirmation sends the graph straight to END, and main()
+    # immediately runs json_to_spoken_text on state["response"] for the final
+    # TTS — so an additional Mercury+TTS narration step here would be the same
+    # "double processing / double output" pattern fixed in retrieve_data.
+    # Skipping the narration on the END path keeps the final TTS as the single
+    # spoken handoff to the user.
+    if confirmed:
+        narrate_node_result("confirm_csv_write_decision", {
+            "decision": "writing to CSV",
+            "analysis_prompt_name": prompt_name,
+            "row_count": len(analysis),
+        })
 
     return {"csv_write_confirmed": confirmed}
 
