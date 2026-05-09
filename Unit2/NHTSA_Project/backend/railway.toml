@@ -27,15 +27,18 @@
 builder = "NIXPACKS"
 
 [deploy]
-# Match the start command used during local smoke tests so behaviour is
-# identical between `uvicorn main:app` on a laptop and on Railway.
+# Railway's service Root Directory should be `Unit2/NHTSA_Project` so the
+# deployment image includes the sibling packages imported by pipeline_runner
+# (`Project_Tools/`, `LangGraph/`, and `LLM_Tools/`). Because the FastAPI ASGI
+# entrypoint still lives in `backend/main.py`, the runtime command must enter
+# `backend/` before asking uvicorn to import `main:app`.
 #   - host=0.0.0.0 binds to every interface (Railway routes traffic to the
 #     container via its internal proxy; binding to 127.0.0.1 would be invisible)
 #   - port=$PORT  — Railway injects $PORT at runtime; uvicorn must use exactly
 #     that value or the platform's healthcheck and routing will fail
 # We do NOT pass --workers; the asyncio.Semaphore in main.py assumes ONE
 # worker, and an 8 GB Hobby instance has no need to fan out for this workload.
-startCommand = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+startCommand = "cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT"
 
 # Railway pings this path after each deploy to gate traffic rollover. If the
 # probe fails (non-2xx) the new deploy is held back and the old one keeps
