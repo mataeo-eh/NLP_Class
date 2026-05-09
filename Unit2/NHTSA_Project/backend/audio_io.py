@@ -258,16 +258,15 @@ def _pcm_s16le_to_wav(pcm_audio: bytes, sample_rate: int) -> bytes:
 
 def synthesize_speech_wav(
     text: str,
-    *,
-    speed: float = 1.0,
 ) -> bytes:
     """
     Synthesize text as WAV bytes through Deepgram's hosted TTS API.
 
-    Deepgram's Speak v1 SDK accepts text, model, encoding, sample_rate, and
-    speed. The existing project preset supplies the model id, so callers do not
-    send a voice/model override from the frontend. We request raw linear16 PCM
-    to match the local Deepgram path, then wrap it in WAV for browser playback.
+    Deepgram's Speak v1 SDK documents text, model, encoding, and sample_rate
+    for REST synthesis. The existing project preset supplies the model id, so
+    callers do not send a voice/model override from the frontend. We request raw
+    linear16 PCM to match the local Deepgram path, then wrap it in WAV for
+    browser playback.
     """
     cleaned_text = text.strip()
     if not cleaned_text:
@@ -287,7 +286,6 @@ def synthesize_speech_wav(
         model=_deepgram_model_id(),
         encoding="linear16",
         sample_rate=_DEEPGRAM_SAMPLE_RATE,
-        speed=float(speed),
     )
     pcm_audio = _deepgram_chunks_to_bytes(response)
     return _pcm_s16le_to_wav(pcm_audio, _DEEPGRAM_SAMPLE_RATE)

@@ -156,8 +156,6 @@ class SpeechRequest(BaseModel):
     exposes only the ones this app needs:
 
     * text: final answer or any frontend text to speak.
-    * speed: positive speech-rate multiplier forwarded to Deepgram.
-
     The Deepgram model id is intentionally owned server-side by the existing
     Runtime_Options voice preset. For Deepgram, that model id is also the voice
     selection, so the frontend cannot accidentally bypass the pre-selected
@@ -170,13 +168,6 @@ class SpeechRequest(BaseModel):
         max_length=4096,
         description="Text to synthesize as browser-playable WAV audio.",
     )
-    speed: float = Field(
-        default=1.0,
-        gt=0,
-        le=2.0,
-        description="Speech speed multiplier forwarded to Deepgram.",
-    )
-
 
 # ---------------------------------------------------------------------------
 # Routes.
@@ -276,13 +267,18 @@ async def synthesize_speech(req: SpeechRequest) -> Response:
             audio_bytes = await asyncio.to_thread(
                 synthesize_speech_wav,
                 req.text,
-                speed=req.speed,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             status = 503 if "not configured" in str(exc) else 502
             raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except Exception as exc:
+            # Keep third-party SDK/runtime failures inside the normal FastAPI
+            # response path. If an exception escapes this route entirely,
+            # Railway returns a plain 500 without CORS headers and browsers
+            # report only "Load failed", hiding the actionable error.
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         return Response(
             content=audio_bytes,
