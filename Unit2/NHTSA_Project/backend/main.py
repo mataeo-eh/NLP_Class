@@ -34,6 +34,8 @@ the *frontend's* domain.
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -44,6 +46,30 @@ from pydantic import BaseModel, Field
 # missing dependency, malformed graph) shows up immediately in the uvicorn
 # logs rather than the first time a user hits /run.
 from pipeline_runner import encode_sse, stream_pipeline
+
+
+# ---------------------------------------------------------------------------
+# Concurrency cap.
+#
+# Why: Render's free tier instance is 512 MB. A single in-flight pipeline run
+# peaks around 400-450 MB resident (Python imports + a pandas read of the
+# 34 MB parquet inflated to ~70 MB + LLM client buffers + graph state).
+# Two simultaneous runs blow past the cap and the instance is killed by the
+# OOM killer mid-stream — every connected client loses their progress.
+#
+# An asyncio.Semaphore is the right primitive here because uvicorn runs all
+# routes inside a single event loop by default. The semaphore is acquired
+# inside the SSE generator so a queued request can still hold an open HTTP
+# connection while it waits, and the lock is released the moment the
+# generator finishes (success OR error path) thanks to the try/finally.
+#
+# A SECOND caller hitting /run while the slot is held will:
+#   - get an immediate `event: busy` frame on its SSE stream
+#   - have the connection closed
+# rather than queue (which would hold an LLM-call's worth of memory in
+# request buffers AND eventually OOM the box).
+# ---------------------------------------------------------------------------
+_PIPELINE_SLOTS = asyncio.Semaphore(1)
 
 
 
@@ -189,8 +215,34 @@ async def run(req: RunRequest) -> StreamingResponse:
        the response closes — defeating the point of a stream.
     """
     async def event_source():
-        async for event in stream_pipeline(req.user_request):
-            yield encode_sse(event)
+        # Try to acquire the single pipeline slot WITHOUT blocking. If another
+        # request already holds it, emit one structured "busy" SSE frame so the
+        # frontend can render a clean message, then close — never queue, since
+        # queueing keeps memory tied up and risks OOMing the second caller's
+        # eventual run too.
+        if not _PIPELINE_SLOTS.locked():
+            await _PIPELINE_SLOTS.acquire()
+        else:
+            yield encode_sse({
+                "event": "busy",
+                "data": {
+                    "message": (
+                        "The backend is already running another pipeline. "
+                        "Render free-tier instances run one request at a time. "
+                        "Wait for the current run to finish and try again."
+                    ),
+                    "retry_after_seconds": 30,
+                },
+            })
+            return
+
+        try:
+            async for event in stream_pipeline(req.user_request):
+                yield encode_sse(event)
+        finally:
+            # Always release — covers normal completion, exceptions inside the
+            # graph, AND client disconnects (Starlette closes the generator).
+            _PIPELINE_SLOTS.release()
 
     return StreamingResponse(
         event_source(),
