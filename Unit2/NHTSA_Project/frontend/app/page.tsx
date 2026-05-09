@@ -6,28 +6,45 @@
 // -------------------------
 // The real frontend is owned by another contributor. This page exists only to
 // give the backend author a way to confirm, in a real browser, that the SSE
-// pipeline works end-to-end (CORS, streaming, event parsing). Anything beyond
-// that — styling, error UX, retries, audio in/out — is intentionally out of
-// scope so it doesn't conflict with the real frontend work.
+// pipeline works end-to-end (CORS, streaming, event parsing). The audio control
+// is intentionally small: it only proves that the browser can call the hosted
+// /audio/speech endpoint after /run returns a final response.
 
 import { useRef, useState } from "react";
 
-const backendBaseUrl =
-  process.env.NEXT_PUBLIC_API_BASE_URL ?? "https://nlp-class.onrender.com";
+const configuredBackendBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL;
+const backendBaseUrl = configuredBackendBaseUrl ?? "";
+
+type SseEvent = {
+  event: string;
+  data: string;
+};
 
 export default function HomePage() {
   const [request, setRequest] = useState(
     "Give me 2 complaints from the database with their CDESCR text",
   );
   const [running, setRunning] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
   const [log, setLog] = useState("");
+  const [finalResponse, setFinalResponse] = useState("");
+  const [audioUrl, setAudioUrl] = useState("");
   // Hold an AbortController so a second click can cancel an in-flight stream
   // rather than fire a parallel one.
   const abortRef = useRef<AbortController | null>(null);
+  const audioUrlRef = useRef("");
 
   // Append a line to the log area without losing existing content.
   function appendLog(line: string) {
     setLog((prev) => (prev ? prev + "\n" + line : line));
+  }
+
+  function replaceAudioUrl(nextUrl: string) {
+    if (audioUrlRef.current) {
+      URL.revokeObjectURL(audioUrlRef.current);
+    }
+    audioUrlRef.current = nextUrl;
+    setAudioUrl(nextUrl);
   }
 
   // Parse a chunk of the SSE byte stream into discrete event frames.
@@ -36,8 +53,8 @@ export default function HomePage() {
   // within each event the lines look like `field: value`. We only care about
   // `event:` (name) and `data:` (JSON payload). The buffer carries any
   // partial trailing event across chunks.
-  function consumeBuffer(buffer: string): { events: Array<{ event: string; data: string }>; rest: string } {
-    const events: Array<{ event: string; data: string }> = [];
+  function consumeBuffer(buffer: string): { events: SseEvent[]; rest: string } {
+    const events: SseEvent[] = [];
     let rest = buffer;
     while (true) {
       const sep = rest.indexOf("\n\n");
@@ -55,7 +72,59 @@ export default function HomePage() {
     return { events, rest };
   }
 
+  function extractFinalResponse(eventData: string): string {
+    try {
+      const payload = JSON.parse(eventData);
+      const response = payload.response;
+      return typeof response === "string" ? response.trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  async function speakText(text: string) {
+    const spokenText = text.trim();
+    if (!backendBaseUrl || !spokenText) return;
+
+    setSpeaking(true);
+    appendLog(`POST ${backendBaseUrl}/audio/speech`);
+    try {
+      const response = await fetch(`${backendBaseUrl}/audio/speech`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: spokenText }),
+      });
+
+      if (!response.ok) {
+        appendLog(`audio HTTP ${response.status} — ${await response.text()}`);
+        return;
+      }
+
+      const blob = await response.blob();
+      const nextUrl = URL.createObjectURL(blob);
+      replaceAudioUrl(nextUrl);
+
+      const audio = new Audio(nextUrl);
+      try {
+        await audio.play();
+        appendLog("[audio] playback started");
+      } catch {
+        appendLog("[audio] browser blocked autoplay; use the audio controls below");
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      appendLog(`audio failed: ${message}`);
+    } finally {
+      setSpeaking(false);
+    }
+  }
+
   async function handleRun() {
+    if (!backendBaseUrl) {
+      appendLog("NEXT_PUBLIC_API_BASE_URL is not configured, so the frontend does not know which backend to call.");
+      return;
+    }
+
     // Cancel any in-flight stream from a previous click.
     abortRef.current?.abort();
     const controller = new AbortController();
@@ -63,6 +132,8 @@ export default function HomePage() {
 
     setRunning(true);
     setLog("");
+    setFinalResponse("");
+    replaceAudioUrl("");
     appendLog(`POST ${backendBaseUrl}/run`);
 
     try {
@@ -89,6 +160,15 @@ export default function HomePage() {
         buffer = rest;
         for (const ev of events) {
           appendLog(`[${ev.event}] ${ev.data}`);
+          if (ev.event === "completed") {
+            const responseText = extractFinalResponse(ev.data);
+            setFinalResponse(responseText);
+            if (responseText) {
+              await speakText(responseText);
+            } else {
+              appendLog("[audio] completed event did not include a response string");
+            }
+          }
         }
       }
     } catch (err) {
@@ -107,65 +187,49 @@ export default function HomePage() {
         <h1>Pipeline smoke test</h1>
         <p className="body-copy">
           Sends one POST to <code>/run</code> on the FastAPI backend and prints
-          each Server-Sent Event as it arrives. Used to confirm the deployed
-          pipeline is alive — not a real UI.
+          each Server-Sent Event as it arrives. When the pipeline completes, it
+          sends the final response to <code>/audio/speech</code> and plays the
+          returned WAV.
         </p>
         <p className="meta-copy">
           Backend base URL:{" "}
-          <a href={backendBaseUrl} target="_blank" rel="noreferrer">
-            {backendBaseUrl}
-          </a>
+          {backendBaseUrl ? (
+            <a href={backendBaseUrl} target="_blank" rel="noreferrer">
+              {backendBaseUrl}
+            </a>
+          ) : (
+            <strong>missing NEXT_PUBLIC_API_BASE_URL</strong>
+          )}
         </p>
 
         <textarea
           value={request}
           onChange={(e) => setRequest(e.target.value)}
           rows={3}
-          style={{
-            width: "100%",
-            marginTop: "1.25rem",
-            padding: "0.75rem",
-            fontFamily: "inherit",
-            fontSize: "0.95rem",
-            border: "1px solid rgba(23, 32, 51, 0.15)",
-            borderRadius: "0.5rem",
-            resize: "vertical",
-          }}
+          className="request-input"
         />
-        <button
-          type="button"
-          onClick={handleRun}
-          disabled={running || request.trim().length === 0}
-          style={{
-            marginTop: "0.75rem",
-            padding: "0.6rem 1.1rem",
-            fontFamily: "inherit",
-            fontSize: "0.95rem",
-            border: "1px solid #172033",
-            borderRadius: "0.5rem",
-            background: running ? "#dde3ee" : "#172033",
-            color: running ? "#5c6b86" : "white",
-            cursor: running ? "default" : "pointer",
-          }}
-        >
-          {running ? "Running…" : "Run pipeline"}
-        </button>
+        <div className="action-row">
+          <button
+            type="button"
+            onClick={handleRun}
+            disabled={running || speaking || request.trim().length === 0 || !backendBaseUrl}
+          >
+            {running ? "Running..." : "Run pipeline"}
+          </button>
+          <button
+            type="button"
+            onClick={() => speakText(finalResponse)}
+            disabled={running || speaking || !finalResponse || !backendBaseUrl}
+          >
+            {speaking ? "Speaking..." : "Replay audio"}
+          </button>
+        </div>
 
-        <pre
-          style={{
-            marginTop: "1.25rem",
-            padding: "0.9rem",
-            background: "#0f1628",
-            color: "#d6e1f4",
-            borderRadius: "0.5rem",
-            fontSize: "0.78rem",
-            lineHeight: 1.45,
-            maxHeight: "24rem",
-            overflow: "auto",
-            whiteSpace: "pre-wrap",
-            wordBreak: "break-word",
-          }}
-        >
+        {audioUrl ? (
+          <audio className="audio-player" src={audioUrl} controls />
+        ) : null}
+
+        <pre className="event-log">
           {log || "(no events yet)"}
         </pre>
       </section>

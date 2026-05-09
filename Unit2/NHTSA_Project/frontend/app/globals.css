@@ -70,3 +70,60 @@ h1 {
 .meta-copy a {
   color: inherit;
 }
+
+.request-input {
+  width: 100%;
+  min-height: 5.5rem;
+  margin-top: 1.25rem;
+  padding: 0.75rem;
+  border: 1px solid rgba(23, 32, 51, 0.15);
+  border-radius: 0.5rem;
+  font: inherit;
+  font-size: 0.95rem;
+  resize: vertical;
+}
+
+.action-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.action-row button {
+  min-height: 2.45rem;
+  padding: 0.6rem 1.1rem;
+  border: 1px solid #172033;
+  border-radius: 0.5rem;
+  background: #172033;
+  color: #ffffff;
+  font: inherit;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.action-row button:disabled {
+  border-color: #c5cede;
+  background: #dde3ee;
+  color: #5c6b86;
+  cursor: default;
+}
+
+.audio-player {
+  width: 100%;
+  margin-top: 1rem;
+}
+
+.event-log {
+  max-height: 24rem;
+  margin: 1.25rem 0 0;
+  padding: 0.9rem;
+  overflow: auto;
+  border-radius: 0.5rem;
+  background: #0f1628;
+  color: #d6e1f4;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

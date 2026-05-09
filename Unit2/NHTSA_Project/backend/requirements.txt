@@ -1,11 +1,11 @@
-# NHTSA Project — Render backend dependencies
+# NHTSA Project — Railway backend dependencies
 #
 # Why this file is hand-curated (and not a `pip freeze` of the whole .venv311)
 # ---------------------------------------------------------------------------
 # The project's local virtualenv has dozens of macOS-only or notebook-only
 # packages (mlx-audio, sounddevice, torch, whisper, jupyter, etc.) that have
 # no business on a Linux web server and would either fail to install or bloat
-# the build. Render's free tier already cold-starts slowly; trimming the
+# the build. Hosted Python instances already cold-start slowly; trimming the
 # install set keeps that responsive.
 #
 # Anything imported lazily (only inside a function body) by Voice_Tools,
@@ -15,6 +15,9 @@
 # --- Web server -------------------------------------------------------------
 fastapi>=0.115,<1.0
 uvicorn[standard]>=0.30,<1.0
+# python-multipart: required by FastAPI when a route accepts UploadFile/File
+# from multipart/form-data, which /audio/transcribe uses for browser audio.
+python-multipart>=0.0.20
 
 # --- LangGraph + LangChain stack -------------------------------------------
 # All three are imported at module load time by Graph.py / Nodes.py / config.py.
@@ -31,20 +34,20 @@ pyarrow>=15.0
 numpy>=1.26,<3.0
 
 # --- Misc utilities ---------------------------------------------------------
-# python-dotenv: load_dotenv() is called from several modules. On Render the
+# python-dotenv: load_dotenv() is called from several modules. On Railway the
 # real env vars are already injected before Python starts, so load_dotenv is
 # effectively a no-op there — but the import itself must still succeed.
 python-dotenv>=1.0
-# requests: used by Audio_Playback's Cartesia/Deepgram HTTP paths. Those paths
-# are gated by is_audio_enabled(), which is False on the backend, so requests
-# is *not* strictly required at runtime. It's kept here so the module imports
-# cleanly even if a future code change moves a `requests` import to module top.
+# requests: used directly by backend/audio_io.py to call hosted OpenAI STT.
 requests>=2.31
+# deepgram-sdk: used lazily by /audio/speech for hosted Deepgram TTS. This is
+# API-backed and does not install local Kokoro, Whisper, torch, or sounddevice.
+deepgram-sdk>=5.3,<6.0
 
 # --- Charting --------------------------------------------------------------
 # matplotlib is INTENTIONALLY OMITTED here. It is the single biggest avoidable
-# import in the LangGraph stack — ~150 MB resident — and Render's free tier
-# is a 512 MB memory cap, so loading matplotlib at startup blew past the
+# import in the LangGraph stack — ~150 MB resident — and small hosted instances
+# can have tight memory caps, so loading matplotlib at startup can blow past the
 # limit and crashed the instance.
 #
 # Chart_Tools.py wraps its matplotlib + Create_Charts imports in a try/except

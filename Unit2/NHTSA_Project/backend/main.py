@@ -3,12 +3,14 @@ NHTSA Project — FastAPI backend.
 
 What this file does
 -------------------
-This is the ASGI entrypoint that uvicorn imports as `main:app` on Render.
+This is the ASGI entrypoint that uvicorn imports as `main:app` on Railway.
 It exposes the LangGraph NHTSA complaint-analysis pipeline as an HTTP API:
 
     GET  /             -> service banner (sanity check)
-    GET  /health       -> 200 OK probe for Render's healthcheck
+    GET  /health       -> 200 OK probe for Railway's healthcheck
     POST /run          -> Server-Sent Events stream of pipeline progress
+    POST /audio/transcribe -> browser audio upload to transcript JSON
+    POST /audio/speech     -> text to browser-playable WAV bytes
 
 The pipeline itself lives in `pipeline_runner.py`, which sets the headless
 runtime flag and imports the compiled LangGraph app. We keep the FastAPI
@@ -21,13 +23,13 @@ Why CORS lives here
 The frontend is hosted on Vercel. Browsers enforce the Same-Origin Policy,
 which means JavaScript running on `https://<vercel-app>.vercel.app` cannot
 read the response body of an XHR / fetch / EventSource request to a
-different origin (this Render URL) unless the Render server explicitly
+different origin (this backend URL) unless the backend server explicitly
 opts in via CORS response headers.
 
 CORS is a SERVER concern, not a client concern: Vercel does not need to
 configure anything; this FastAPI app does. The `allow_origins` list below
 is the allowlist of caller origins this server will accept, NOT a list of
-where this server can be hosted. Adding the Render URL itself to that list
+where this server can be hosted. Adding the backend URL itself to that list
 would do nothing useful, since browsers stamp the request's `Origin` with
 the *frontend's* domain.
 """
@@ -36,9 +38,9 @@ from __future__ import annotations
 
 import asyncio
 
-from fastapi import FastAPI
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 # pipeline_runner sets the headless flag and imports the compiled graph at
@@ -46,12 +48,17 @@ from pydantic import BaseModel, Field
 # missing dependency, malformed graph) shows up immediately in the uvicorn
 # logs rather than the first time a user hits /run.
 from pipeline_runner import encode_sse, stream_pipeline
+from audio_io import (
+    MAX_AUDIO_UPLOAD_BYTES,
+    synthesize_speech_wav,
+    transcribe_audio_bytes,
+)
 
 
 # ---------------------------------------------------------------------------
 # Concurrency cap.
 #
-# Why: Render's free tier instance is 512 MB. A single in-flight pipeline run
+# Why: smaller hosted instances have finite memory. A single in-flight pipeline run
 # peaks around 400-450 MB resident (Python imports + a pandas read of the
 # 34 MB parquet inflated to ~70 MB + LLM client buffers + graph state).
 # Two simultaneous runs blow past the cap and the instance is killed by the
@@ -70,6 +77,7 @@ from pipeline_runner import encode_sse, stream_pipeline
 # request buffers AND eventually OOM the box).
 # ---------------------------------------------------------------------------
 _PIPELINE_SLOTS = asyncio.Semaphore(1)
+_AUDIO_SLOTS = asyncio.Semaphore(1)
 
 
 
@@ -81,9 +89,10 @@ app = FastAPI(
     description=(
         "FastAPI service that hosts the LangGraph NHTSA complaint-analysis "
         "pipeline. The /run endpoint streams pipeline progress to the "
-        "frontend via Server-Sent Events."
+        "frontend via Server-Sent Events. The /audio/* endpoints provide "
+        "browser-native speech-to-text and text-to-speech I/O."
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
 
@@ -139,6 +148,36 @@ class RunRequest(BaseModel):
     )
 
 
+class SpeechRequest(BaseModel):
+    """
+    Request body for POST /audio/speech.
+
+    Deepgram's speech endpoint accepts several synthesis fields. The hosted backend
+    exposes only the ones this app needs:
+
+    * text: final answer or any frontend text to speak.
+    * speed: positive speech-rate multiplier forwarded to Deepgram.
+
+    The Deepgram model id is intentionally owned server-side by the existing
+    Runtime_Options voice preset. For Deepgram, that model id is also the voice
+    selection, so the frontend cannot accidentally bypass the pre-selected
+    voice.
+    """
+
+    text: str = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Text to synthesize as browser-playable WAV audio.",
+    )
+    speed: float = Field(
+        default=1.0,
+        gt=0,
+        le=2.0,
+        description="Speech speed multiplier forwarded to Deepgram.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes.
 # ---------------------------------------------------------------------------
@@ -152,17 +191,109 @@ async def read_root() -> dict[str, str]:
         "service": "nhtsa-project-backend",
         "status": "ok",
         "version": app.version,
-        "endpoints": "GET /health, POST /run",
+        "endpoints": "GET /health, POST /run, POST /audio/transcribe, POST /audio/speech",
     }
 
 
 @app.get("/health")
 async def healthcheck() -> dict[str, str]:
     """
-    Lightweight liveness probe for Render's healthcheck system. Returning a
-    static 200 OK is sufficient — Render only cares about the status code.
+    Lightweight liveness probe for Railway's healthcheck system. Returning a
+    static 200 OK is sufficient — Railway only cares about the status code.
     """
     return {"status": "ok"}
+
+
+@app.post("/audio/transcribe")
+async def transcribe_audio(
+    audio: UploadFile = File(
+        ...,
+        description=(
+            "Browser-recorded or user-selected audio file. Supported containers "
+            "include webm, wav, mp3, m4a/mp4, ogg/opus, flac, and aac."
+        ),
+    ),
+    language: str = "en",
+) -> dict:
+    """
+    Convert uploaded browser audio into text for POST /run.
+
+    FastAPI exposes UploadFile with three concrete fields we consume here:
+    `filename`, `content_type`, and the async `read()` method. The body is read
+    up to MAX_AUDIO_UPLOAD_BYTES + 1 so oversized uploads are rejected before
+    bytes are forwarded to the hosted transcription API.
+    """
+    if _AUDIO_SLOTS.locked():
+        raise HTTPException(
+            status_code=429,
+            detail="Another audio request is already running. Try again when it finishes.",
+        )
+
+    await _AUDIO_SLOTS.acquire()
+    try:
+        payload = await audio.read(MAX_AUDIO_UPLOAD_BYTES + 1)
+        try:
+            return await asyncio.to_thread(
+                transcribe_audio_bytes,
+                payload,
+                audio.filename,
+                audio.content_type,
+                language,
+            )
+        except ValueError as exc:
+            detail = str(exc)
+            if "limit is" in detail:
+                status_code = 413
+            elif "content type" in detail:
+                status_code = 415
+            else:
+                status_code = 400
+            raise HTTPException(status_code=status_code, detail=detail) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+    finally:
+        _AUDIO_SLOTS.release()
+
+
+@app.post("/audio/speech")
+async def synthesize_speech(req: SpeechRequest) -> Response:
+    """
+    Convert text into browser-playable WAV bytes.
+
+    The CLI TTS helpers play audio locally. This route deliberately returns an
+    HTTP `audio/wav` body instead, which lets the frontend attach the bytes to an
+    `<audio>` element or Web Audio API pipeline without server-side speakers.
+    """
+    if _AUDIO_SLOTS.locked():
+        raise HTTPException(
+            status_code=429,
+            detail="Another audio request is already running. Try again when it finishes.",
+        )
+
+    await _AUDIO_SLOTS.acquire()
+    try:
+        try:
+            audio_bytes = await asyncio.to_thread(
+                synthesize_speech_wav,
+                req.text,
+                speed=req.speed,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            status = 503 if "not configured" in str(exc) else 502
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+
+        return Response(
+            content=audio_bytes,
+            media_type="audio/wav",
+            headers={
+                "Content-Disposition": 'inline; filename="nhtsa-response.wav"',
+                "Cache-Control": "no-store",
+            },
+        )
+    finally:
+        _AUDIO_SLOTS.release()
 
 
 @app.post("/run")
@@ -210,7 +341,7 @@ async def run(req: RunRequest) -> StreamingResponse:
        treat the response as a stream without it.
     - `Cache-Control: no-cache` — ensures intermediate caches don't buffer
        progress events.
-    - `X-Accel-Buffering: no` — tells nginx-style reverse proxies (Render's
+    - `X-Accel-Buffering: no` — tells nginx-style reverse proxies (Railway's
        edge) to NOT buffer. Without it, events can sit in a buffer until
        the response closes — defeating the point of a stream.
     """
@@ -228,7 +359,7 @@ async def run(req: RunRequest) -> StreamingResponse:
                 "data": {
                     "message": (
                         "The backend is already running another pipeline. "
-                        "Render free-tier instances run one request at a time. "
+                        "This deployment runs one pipeline request at a time. "
                         "Wait for the current run to finish and try again."
                     ),
                     "retry_after_seconds": 30,
