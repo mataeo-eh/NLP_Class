@@ -63,8 +63,16 @@ list would do nothing.
 | ---------------- | -------------------------------------------------- |
 | Root Directory   | `Unit2/NHTSA_Project/backend`                      |
 | Runtime          | Python                                             |
+| Python Version   | `3.11` (pinned via `.python-version`)              |
 | Build Command    | `pip install -r requirements.txt`                  |
 | Start Command    | `uvicorn main:app --host 0.0.0.0 --port $PORT`     |
+
+`.python-version` keeps Render on the same major/minor as the local
+`.venv311` (currently `Python 3.11.14`). Without it, Render defaults to the
+latest CPython release at service-creation time (currently 3.14.x), which
+breaks ML/data wheels that haven't published 3.14 builds yet. Pinning to
+`3.11` (no patch) lets Render pick the latest 3.11.x — stable and ABI
+compatible with the local venv.
 
 Environment variables on Render must include the same keys the local `.env`
 provides (e.g. `OPENAI_API_KEY`, `INCEPTION_API_KEY`). `load_dotenv()` is a
