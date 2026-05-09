@@ -6,7 +6,18 @@ import threading
 import time
 import random
 
-import litellm
+# litellm is only consulted by process_and_store_response (the retry wrapper used
+# by NHTSA_Project_Main.py's CLI). The LangGraph pipeline imports this module
+# solely for append_to_csv / ensure_output_dir / get_processed_df_indices, none
+# of which touch litellm. The FastAPI backend on Render therefore doesn't need
+# litellm installed — wrapping the import in try/except keeps this module
+# importable in that environment. If litellm IS unavailable and someone calls
+# process_and_store_response anyway, _RETRYABLE_ERRORS is empty so server-side
+# errors propagate without retry rather than crashing on a missing attribute.
+try:
+    import litellm
+except ImportError:
+    litellm = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -32,12 +43,16 @@ def _get_csv_lock(csv_path: str) -> threading.Lock:
 # ---------------------------------------------------------------------------
 # These are transient infrastructure errors — the request was well-formed but
 # the server couldn't handle it. Each is worth retrying after a back-off.
-_RETRYABLE_ERRORS = (
-    litellm.RateLimitError,          # 429 — rate limit hit
-    litellm.ServiceUnavailableError, # 503 — server temporarily unavailable
-    litellm.Timeout,                 # request timed out before a response
-    litellm.APIConnectionError,      # network-level connection failure
-    litellm.InternalServerError,     # 500/502 — server-side crash
+_RETRYABLE_ERRORS: tuple = (
+    (
+        litellm.RateLimitError,          # 429 — rate limit hit
+        litellm.ServiceUnavailableError, # 503 — server temporarily unavailable
+        litellm.Timeout,                 # request timed out before a response
+        litellm.APIConnectionError,      # network-level connection failure
+        litellm.InternalServerError,     # 500/502 — server-side crash
+    )
+    if litellm is not None
+    else ()
 )
 
 # How many times to retry after a server-side error survives LiteLLM's own
