@@ -15,6 +15,8 @@ opts in, tools assume text mode so debugging never accidentally pulls in the
 optional audio stack.
 """
 
+from collections.abc import Callable
+
 _AUDIO_ENABLED = False
 
 # Headless mode flag — set to True by the FastAPI backend at startup so every
@@ -31,6 +33,13 @@ _AUDIO_ENABLED = False
 # polite refusal string the LLM can read and adapt to. _HEADLESS_MODE is the
 # single source of truth for that distinction.
 _HEADLESS_MODE = False
+
+# Optional hosted-backend narration sink. When the FastAPI adapter is running
+# in headless mode, it can register a callable here to receive the Mercury
+# progress prose that narrate_progress() would otherwise only print to stdout.
+# The local CLI never sets this, so existing speaker/stdout behaviour is
+# unchanged outside the hosted path.
+_HEADLESS_NARRATION_SINK: Callable[[str], None] | None = None
 
 # Voice-model selector — chosen once at process start by the LangGraph CLI and
 # read by Audio_Playback.generate_TTS_audio on every TTS call. The selector is a
@@ -131,6 +140,34 @@ def is_headless_mode() -> bool:
     to decide whether to ask the user or return a structured refusal string.
     """
     return _HEADLESS_MODE
+
+
+def set_headless_narration_sink(sink: Callable[[str], None] | None) -> None:
+    """
+    Register or clear the hosted-backend narration sink.
+
+    The FastAPI SSE adapter uses this to collect Mercury-generated reasoning
+    narration from Project_Tools.Audio_Playback while keeping the local CLI
+    contract unchanged. Passing None removes any previously registered sink.
+    """
+    global _HEADLESS_NARRATION_SINK
+    _HEADLESS_NARRATION_SINK = sink
+
+
+def emit_headless_narration(text: str) -> None:
+    """
+    Forward narration text to the currently registered headless sink, if any.
+
+    This is intentionally a no-op when no sink is registered so local CLI runs
+    and ad hoc imports do not need to special-case the hosted backend.
+    """
+    if not isinstance(text, str):
+        return
+    cleaned = text.strip()
+    if not cleaned:
+        return
+    if _HEADLESS_NARRATION_SINK is not None:
+        _HEADLESS_NARRATION_SINK(cleaned)
 
 
 def set_voice_model(model: str) -> None:

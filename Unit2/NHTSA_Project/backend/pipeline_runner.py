@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import sys
 import traceback
+from collections import deque
 from pathlib import Path
 from typing import Any, AsyncIterator
 
@@ -66,6 +67,7 @@ for path in (str(LANGGRAPH_DIR), str(LLM_TOOLS_DIR), str(PROJECT_ROOT)):
 # ---------------------------------------------------------------------------
 from Project_Tools.Runtime_Options import (  # noqa: E402  (intentional import order)
     set_audio_enabled,
+    set_headless_narration_sink,
     set_headless_mode,
 )
 
@@ -84,6 +86,11 @@ set_headless_mode(True)
 import Graph as _graph_module  # noqa: E402
 
 graph_app = _graph_module.app
+WELCOME_TTS_TEXT = getattr(
+    _graph_module,
+    "WELCOME_TTS_TEXT",
+    "Welcome back! What NHTSA adventure shall we embark on?",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +156,12 @@ def _summarise_delta(delta: dict[str, Any]) -> dict[str, Any]:
     """
     summary: dict[str, Any] = {}
     for key, value in delta.items():
+        if key == "response":
+            # The terminal user-facing prose is emitted exactly once via the
+            # dedicated `completed` event below. Excluding it from per-node
+            # updates prevents terminal nodes (retrieve_data, agentic_* paths)
+            # from sending the same final answer twice back-to-back.
+            continue
         if key in ("query_result", "analysis", "iteration_log") and isinstance(value, list):
             # Send a count plus the first element as a sample — enough for the
             # frontend to display "retrieved 12 rows" without shipping the
@@ -160,6 +173,25 @@ def _summarise_delta(delta: dict[str, Any]) -> dict[str, Any]:
         else:
             summary[key] = _to_jsonable(value)
     return summary
+
+
+def _drain_narration_events(queue: deque[str]) -> list[dict[str, Any]]:
+    """Convert queued Mercury narration strings into explicit SSE events."""
+    events: list[dict[str, Any]] = []
+    while queue:
+        text = queue.popleft().strip()
+        if not text:
+            continue
+        events.append(
+            {
+                "event": "narration",
+                "data": {
+                    "channel": "progress",
+                    "text": text,
+                },
+            }
+        )
+    return events
 
 
 # ---------------------------------------------------------------------------
@@ -183,6 +215,12 @@ async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
     yield {"event": "started", "data": {"user_request": user_request}}
 
     final_state: dict[str, Any] = {}
+    narration_queue: deque[str] = deque()
+
+    def enqueue_narration(text: str) -> None:
+        narration_queue.append(text)
+
+    set_headless_narration_sink(enqueue_narration)
     try:
         # LangGraph's astream() with default stream_mode emits one chunk per
         # node completion. Each chunk is a {node_name: state_delta} dict. We
@@ -193,6 +231,8 @@ async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
                 # Defensive: if a future LangGraph version changes the chunk
                 # shape, fall back to a generic event rather than crashing.
                 yield {"event": "node_update", "data": {"raw": _to_jsonable(chunk)}}
+                for narration_event in _drain_narration_events(narration_queue):
+                    yield narration_event
                 continue
 
             for node_name, delta in chunk.items():
@@ -201,11 +241,20 @@ async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
                 # response field even though astream only returns deltas.
                 if isinstance(delta, dict):
                     final_state.update(delta)
-                yield {
-                    "event": "node_update",
-                    "data": {"node": str(node_name), "delta": summary},
-                }
+                # If the node only contributed the terminal `response` field,
+                # `_summarise_delta()` returns {} on purpose. In that case the
+                # very next event will be `completed` with the same response, so
+                # suppress the redundant intermediate node_update entirely.
+                if summary:
+                    yield {
+                        "event": "node_update",
+                        "data": {"node": str(node_name), "delta": summary},
+                    }
+                for narration_event in _drain_narration_events(narration_queue):
+                    yield narration_event
 
+        for narration_event in _drain_narration_events(narration_queue):
+            yield narration_event
         yield {
             "event": "completed",
             "data": {
@@ -225,6 +274,8 @@ async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
         # stack traces over the wire because they leak file paths and library
         # versions to whoever can hit /run.
         traceback.print_exc()
+        for narration_event in _drain_narration_events(narration_queue):
+            yield narration_event
         yield {
             "event": "error",
             "data": {
@@ -232,6 +283,8 @@ async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
                 "type": type(exc).__name__,
             },
         }
+    finally:
+        set_headless_narration_sink(None)
 
 
 def encode_sse(event: dict[str, Any]) -> str:

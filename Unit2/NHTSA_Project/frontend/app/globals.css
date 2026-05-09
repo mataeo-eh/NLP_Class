@@ -71,6 +71,32 @@ h1 {
   color: inherit;
 }
 
+.status-box {
+  margin-top: 1.25rem;
+  padding: 0.9rem 1rem;
+  border: 1px solid rgba(23, 32, 51, 0.12);
+  border-radius: 0.75rem;
+  background: linear-gradient(135deg, rgba(23, 32, 51, 0.05), rgba(92, 107, 134, 0.08));
+  color: #1b2740;
+  font-size: 0.95rem;
+  line-height: 1.5;
+}
+
+.status-box[data-state="ready"] {
+  border-color: rgba(18, 111, 72, 0.18);
+  background: linear-gradient(135deg, rgba(18, 111, 72, 0.08), rgba(232, 247, 240, 0.92));
+}
+
+.status-box[data-state="running"] {
+  border-color: rgba(168, 107, 26, 0.2);
+  background: linear-gradient(135deg, rgba(168, 107, 26, 0.09), rgba(255, 248, 235, 0.96));
+}
+
+.status-box[data-state="recording"] {
+  border-color: rgba(147, 31, 59, 0.22);
+  background: linear-gradient(135deg, rgba(147, 31, 59, 0.1), rgba(255, 240, 244, 0.96));
+}
+
 .request-input {
   width: 100%;
   min-height: 5.5rem;
@@ -100,6 +126,11 @@ h1 {
   font: inherit;
   font-size: 0.95rem;
   cursor: pointer;
+}
+
+.action-row .recording-button {
+  border-color: #931f3b;
+  background: #931f3b;
 }
 
 .action-row button:disabled {

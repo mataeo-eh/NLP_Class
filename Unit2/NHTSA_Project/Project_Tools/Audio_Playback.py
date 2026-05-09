@@ -4,6 +4,8 @@ import wave
 import datetime as _dt
 from dotenv import load_dotenv
 from Project_Tools.Runtime_Options import (
+    emit_headless_narration,
+    is_headless_mode,
     is_audio_enabled,
     get_voice_model,
     get_voice_preset,
@@ -563,16 +565,20 @@ def narrate_progress(text: str) -> None:
     # speak with the same voice as the rest of the pipeline.
     if not text or not text.strip():
         return
+    cleaned_text = text.strip()
     # Headless / non-audio mode: TTS playback is unavailable (no speakers, or
     # audio explicitly disabled), so route the Mercury-summarised text into
-    # stdout instead. Render-style hosting captures stdout in the deployment
-    # logs, which is the only "output channel" the headless backend has for
-    # per-node prose without a wired-up SSE narration field.
+    # stdout instead. When the hosted FastAPI backend has registered a narration
+    # sink, forward the exact same prose there as well so the browser can speak
+    # it through the streamed TTS endpoint. The stdout print stays in place for
+    # deployment logs and local debugging.
     if not is_audio_enabled():
-        print(f"[progress] {text}")
+        if is_headless_mode():
+            emit_headless_narration(cleaned_text)
+        print(f"[progress] {cleaned_text}")
         return
     generate_TTS_audio(
-        text=text,
+        text=cleaned_text,
         speed=1.1,
         streaming_interval=0.7,
         play=True,

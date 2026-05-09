@@ -8,9 +8,11 @@ It exposes the LangGraph NHTSA complaint-analysis pipeline as an HTTP API:
 
     GET  /             -> service banner (sanity check)
     GET  /health       -> 200 OK probe for Railway's healthcheck
+    POST /session/warmup -> returns the CLI greeting text for frontend warmup
     POST /run          -> Server-Sent Events stream of pipeline progress
     POST /audio/transcribe -> browser audio upload to transcript JSON
     POST /audio/speech     -> text to browser-playable WAV bytes
+    POST /audio/speech/stream -> low-latency PCM byte stream for browser playback
 
 The pipeline itself lives in `pipeline_runner.py`, which sets the headless
 runtime flag and imports the compiled LangGraph app. We keep the FastAPI
@@ -47,9 +49,13 @@ from pydantic import BaseModel, Field
 # module load. Importing it here means any startup-time failure (bad path,
 # missing dependency, malformed graph) shows up immediately in the uvicorn
 # logs rather than the first time a user hits /run.
-from pipeline_runner import encode_sse, stream_pipeline
+from pipeline_runner import WELCOME_TTS_TEXT, encode_sse, stream_pipeline
 from audio_io import (
     MAX_AUDIO_UPLOAD_BYTES,
+    _DEEPGRAM_CHANNELS,
+    _DEEPGRAM_PCM_ENCODING,
+    _DEEPGRAM_SAMPLE_RATE,
+    synthesize_speech_pcm_stream,
     synthesize_speech_wav,
     transcribe_audio_bytes,
 )
@@ -169,6 +175,25 @@ class SpeechRequest(BaseModel):
         description="Text to synthesize as browser-playable WAV audio.",
     )
 
+
+class WarmupResponse(BaseModel):
+    """
+    Hosted warmup payload for the minimal web client.
+
+    The frontend uses the same greeting copy as the local CLI so the hosted
+    flow begins with the familiar spoken handoff, then transitions into either
+    typed input or push-to-talk upload.
+    """
+
+    welcome_text: str = Field(
+        ...,
+        description="Greeting text the frontend should speak through /audio/speech/stream.",
+    )
+    ready_prompt: str = Field(
+        ...,
+        description="Short UI status message to show when the browser can capture or send input.",
+    )
+
 # ---------------------------------------------------------------------------
 # Routes.
 # ---------------------------------------------------------------------------
@@ -182,7 +207,10 @@ async def read_root() -> dict[str, str]:
         "service": "nhtsa-project-backend",
         "status": "ok",
         "version": app.version,
-        "endpoints": "GET /health, POST /run, POST /audio/transcribe, POST /audio/speech",
+        "endpoints": (
+            "GET /health, POST /session/warmup, POST /run, POST /audio/transcribe, "
+            "POST /audio/speech, POST /audio/speech/stream"
+        ),
     }
 
 
@@ -193,6 +221,22 @@ async def healthcheck() -> dict[str, str]:
     static 200 OK is sufficient — Railway only cares about the status code.
     """
     return {"status": "ok"}
+
+
+@app.post("/session/warmup", response_model=WarmupResponse)
+async def warmup_session() -> WarmupResponse:
+    """
+    Return the hosted warmup text that mirrors the CLI greeting.
+
+    The route is intentionally lightweight: it does not open any audio devices
+    or create server-side session state. The browser remains responsible for
+    microphone permission and push-to-talk capture, while the backend stays the
+    source of truth for the greeting copy and ready-state prompt.
+    """
+    return WarmupResponse(
+        welcome_text=WELCOME_TTS_TEXT,
+        ready_prompt="Speak now.",
+    )
 
 
 @app.post("/audio/transcribe")
@@ -290,6 +334,70 @@ async def synthesize_speech(req: SpeechRequest) -> Response:
         )
     finally:
         _AUDIO_SLOTS.release()
+
+
+@app.post("/audio/speech/stream")
+async def stream_speech(req: SpeechRequest) -> StreamingResponse:
+    """
+    Stream raw PCM bytes for immediate browser playback.
+
+    Why this route exists
+    ---------------------
+    `/audio/speech` intentionally returns a finished WAV file, which is useful
+    for replay controls but forces the client to wait for the full synthesis to
+    finish before playback can begin. This companion route exposes Deepgram's
+    chunked output as a streaming HTTP body so the frontend can schedule each
+    PCM chunk in the Web Audio API as soon as it arrives.
+
+    Explicit frontend contract
+    --------------------------
+    The response body is NOT a self-describing audio container. The frontend
+    must read the headers below and handle them programmatically:
+
+    * `X-Audio-Codec: linear16`
+    * `X-Audio-Sample-Rate: 24000`
+    * `X-Audio-Channels: 1`
+
+    If the browser client cannot handle that contract, it should fall back to
+    the buffered WAV endpoint instead of guessing.
+    """
+    if _AUDIO_SLOTS.locked():
+        raise HTTPException(
+            status_code=429,
+            detail="Another audio request is already running. Try again when it finishes.",
+        )
+
+    await _AUDIO_SLOTS.acquire()
+    try:
+        try:
+            pcm_chunks = synthesize_speech_pcm_stream(req.text)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            status = 503 if "not configured" in str(exc) else 502
+            raise HTTPException(status_code=status, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+        def generate_pcm_chunks():
+            try:
+                yield from pcm_chunks
+            finally:
+                _AUDIO_SLOTS.release()
+
+        return StreamingResponse(
+            generate_pcm_chunks(),
+            media_type="application/octet-stream",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Audio-Codec": _DEEPGRAM_PCM_ENCODING,
+                "X-Audio-Sample-Rate": str(_DEEPGRAM_SAMPLE_RATE),
+                "X-Audio-Channels": str(_DEEPGRAM_CHANNELS),
+            },
+        )
+    except Exception:
+        _AUDIO_SLOTS.release()
+        raise
 
 
 @app.post("/run")

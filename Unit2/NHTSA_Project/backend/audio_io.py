@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import sys
 import wave
+from collections.abc import Iterator
 from io import BytesIO
 from pathlib import Path
 
@@ -94,7 +95,13 @@ if str(PROJECT_ROOT) not in sys.path:
 #   model       -> Deepgram Aura voice/model id (voice is baked into the id)
 #   encoding    -> linear16 raw little-endian PCM
 #   sample_rate -> 24000 Hz for Aura 2 voices
+#
+# The hosted frontend uses the same raw PCM stream for low-latency playback in
+# the browser's Web Audio API, then wraps the accumulated bytes into WAV only
+# when it needs a replayable/downloadable asset after streaming finishes.
 _DEEPGRAM_SAMPLE_RATE = 24000
+_DEEPGRAM_CHANNELS = 1
+_DEEPGRAM_PCM_ENCODING = "linear16"
 
 
 def _safe_filename(filename: str | None) -> str:
@@ -214,9 +221,9 @@ def _deepgram_api_key() -> str:
     return api_key
 
 
-def _deepgram_chunks_to_bytes(response) -> bytes:
+def _iter_deepgram_audio_chunks(response) -> Iterator[bytes]:
     """
-    Normalize documented Deepgram SDK response variants into one byte string.
+    Normalize documented Deepgram SDK response variants into a byte iterator.
 
     Deepgram SDK examples show two concrete shapes:
     * an object with `response.stream.getvalue()` for buffered output
@@ -226,20 +233,53 @@ def _deepgram_chunks_to_bytes(response) -> bytes:
     else instead of guessing.
     """
     if isinstance(response, bytes):
-        return response
+        yield response
+        return
     if isinstance(response, bytearray):
-        return bytes(response)
+        yield bytes(response)
+        return
+
     stream = getattr(response, "stream", None)
     if stream is not None and hasattr(stream, "getvalue"):
-        return stream.getvalue()
+        buffered = stream.getvalue()
+        if not buffered:
+            raise RuntimeError("Deepgram TTS returned no audio bytes.")
+        yield buffered
+        return
 
     try:
-        return b"".join(chunk for chunk in response if chunk)
+        saw_audio = False
+        for chunk in response:
+            if not chunk:
+                continue
+            if isinstance(chunk, bytes):
+                saw_audio = True
+                yield chunk
+                continue
+            if isinstance(chunk, bytearray):
+                saw_audio = True
+                yield bytes(chunk)
+                continue
+            raise RuntimeError(
+                "Deepgram TTS yielded a non-bytes chunk; expected bytes or bytearray."
+            )
+        if not saw_audio:
+            raise RuntimeError("Deepgram TTS returned no audio bytes.")
     except TypeError as exc:
         raise RuntimeError(
             "Deepgram TTS returned an unsupported response shape; expected "
             "bytes, a stream buffer, or an iterator of byte chunks."
         ) from exc
+
+
+def _deepgram_chunks_to_bytes(response) -> bytes:
+    """
+    Collect a documented Deepgram streaming/buffered response into one byte string.
+
+    This is used by the buffered WAV route, while the streaming route forwards
+    the same chunks directly to the browser.
+    """
+    return b"".join(_iter_deepgram_audio_chunks(response))
 
 
 def _pcm_s16le_to_wav(pcm_audio: bytes, sample_rate: int) -> bytes:
@@ -284,8 +324,52 @@ def synthesize_speech_wav(
     response = client.speak.v1.audio.generate(
         text=cleaned_text,
         model=_deepgram_model_id(),
-        encoding="linear16",
+        encoding=_DEEPGRAM_PCM_ENCODING,
         sample_rate=_DEEPGRAM_SAMPLE_RATE,
     )
     pcm_audio = _deepgram_chunks_to_bytes(response)
     return _pcm_s16le_to_wav(pcm_audio, _DEEPGRAM_SAMPLE_RATE)
+
+
+def synthesize_speech_pcm_stream(
+    text: str,
+) -> Iterator[bytes]:
+    """
+    Stream Deepgram speech bytes as raw mono PCM chunks for browser playback.
+
+    Request/response contract
+    -------------------------
+    The Deepgram Python SDK documents `client.speak.v1.audio.generate(...)` as
+    returning either a buffered object (`response.stream.getvalue()`) or an
+    iterator of byte chunks. This function normalizes both shapes into one
+    iterator of PCM `bytes` so FastAPI can expose a deterministic streaming
+    contract to the frontend:
+
+    * encoding      -> `linear16`
+    * sample_rate   -> 24000 Hz
+    * channels      -> 1 (mono)
+
+    The frontend reads those values from explicit HTTP headers and uses the Web
+    Audio API to schedule playback chunk-by-chunk after a user gesture unlocks
+    the audio context.
+    """
+    cleaned_text = text.strip()
+    if not cleaned_text:
+        raise ValueError("Text is required for speech synthesis.")
+
+    try:
+        from deepgram import DeepgramClient  # noqa: PLC0415
+    except Exception as exc:
+        raise RuntimeError(
+            "Deepgram TTS requires the `deepgram-sdk` package, which could not "
+            f"be imported. Original error: {exc}"
+        ) from exc
+
+    client = DeepgramClient(api_key=_deepgram_api_key())
+    response = client.speak.v1.audio.generate(
+        text=cleaned_text,
+        model=_deepgram_model_id(),
+        encoding=_DEEPGRAM_PCM_ENCODING,
+        sample_rate=_DEEPGRAM_SAMPLE_RATE,
+    )
+    return _iter_deepgram_audio_chunks(response)

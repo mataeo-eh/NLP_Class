@@ -55,6 +55,8 @@ engine causes the CLI to exit with a clear error.
 Example: python Unit2/NHTSA_Project/LangGraph/Graph.py -a -v deepgram -vp aura-2-hyperion-en
 '''
 
+WELCOME_TTS_TEXT = "Welcome back! What NHTSA adventure shall we embark on?"
+
 
 
 def json_to_spoken_text(data: dict | str) -> str:
@@ -348,7 +350,7 @@ def main() -> None:
     # which encode language in their model id and stream natively.
     if audio_available:
         generate_TTS_audio(
-            text="Welcome back! What NHTSA adventure shall we embark on?",
+            text=WELCOME_TTS_TEXT,
             speed=0.85,
             lang_code="a",
             play=True,
