@@ -41,12 +41,14 @@ python-dotenv>=1.0
 # cleanly even if a future code change moves a `requests` import to module top.
 requests>=2.31
 
-# --- Charting (Chart_Tools.py imports matplotlib at module top) ------------
-# matplotlib is needed because Chart_Tools.py — which is in the agentic_explore
-# tool list and therefore in the import chain of LangGraph/Nodes.py — does
-# `import matplotlib` and `import matplotlib.pyplot as plt` unconditionally
-# at module load time. Even though no chart can render server-side (the
-# Preview-stdin / xdg-open code paths can't work on Render), the import
-# itself must still succeed. Headless = no display, so we rely on the Agg
-# backend that Chart_Tools sets explicitly before pyplot loads.
-matplotlib>=3.8,<4.0
+# --- Charting --------------------------------------------------------------
+# matplotlib is INTENTIONALLY OMITTED here. It is the single biggest avoidable
+# import in the LangGraph stack — ~150 MB resident — and Render's free tier
+# is a 512 MB memory cap, so loading matplotlib at startup blew past the
+# limit and crashed the instance.
+#
+# Chart_Tools.py wraps its matplotlib + Create_Charts imports in a try/except
+# and exposes a `_CHART_BACKEND_READY` flag. When matplotlib is absent (this
+# environment), each chart @tool short-circuits to a structured refusal that
+# the LLM can read and adapt to. On the local CLI matplotlib is installed, so
+# every chart still renders normally.

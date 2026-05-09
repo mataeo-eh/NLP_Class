@@ -41,17 +41,6 @@ DESIGN CONSTRAINTS
 See also: Unit2/NHTSA_Project/CLAUDE.md — "LangGraph Pipeline Chart Exception".
 """
 
-# ---------------------------------------------------------------------------
-# CRITICAL: matplotlib backend MUST be set before any pyplot import.
-# "Agg" is a non-interactive, off-screen rasteriser — it writes pixels to
-# memory rather than opening a GUI window.  Setting it here ensures the entire
-# LangGraph process uses Agg, which is required because we pipe rendered PNGs
-# to Preview via stdin rather than calling plt.show().
-# ---------------------------------------------------------------------------
-import matplotlib
-matplotlib.use("Agg")          # must precede "import matplotlib.pyplot as plt"
-import matplotlib.pyplot as plt  # noqa: E402  (import order is intentional)
-
 import json
 import os
 import platform
@@ -63,19 +52,82 @@ from pathlib import Path
 
 from langchain_core.tools import tool
 
+# is_headless_mode is consulted at the top of every chart @tool so the FastAPI
+# backend never touches matplotlib at all — the server has no display and no
+# memory budget for a 150-MB import that would only render a PNG nobody can see.
+from Project_Tools.Runtime_Options import is_headless_mode
+
 # ---------------------------------------------------------------------------
-# Ensure Create_Charts.py is importable: insert this file's directory at the
-# front of sys.path so "import Create_Charts" resolves without needing the
-# caller to manage sys.path.  We use index 0 so it takes priority over any
-# stale package entries that might shadow local modules.
+# Lazy / optional matplotlib + Create_Charts import.
+#
+# The local CLI ABSOLUTELY needs the original behaviour: matplotlib's "Agg"
+# backend MUST be selected BEFORE pyplot is loaded, then Create_Charts is
+# imported so its top-level `import matplotlib.pyplot as plt` inherits that
+# backend.  See `LangGraph Pipeline Chart Exception` in CLAUDE.md.
+#
+# The hosted backend on Render's 512 MB free tier cannot afford the import
+# (matplotlib alone is ~150 MB resident, and Create_Charts also pulls pandas
+# + numpy at module top).  We solve both cases by wrapping the import block
+# in try/except:
+#
+#   - If matplotlib + Create_Charts are present (local venv), the original
+#     Agg-before-pyplot ordering is preserved exactly.  Chart tools work.
+#
+#   - If either import fails (Render, no matplotlib), `_CHART_BACKEND_READY`
+#     stays False and every chart @tool returns a structured refusal string
+#     instead of trying to render.  This module remains importable so the
+#     compiled LangGraph that contains these tools loads cleanly.
+#
+# We also short-circuit on is_headless_mode() at the top of every @tool, so
+# even if a future Render image happens to ship matplotlib, the chart tools
+# never actually render server-side.  Belt-and-suspenders.
 # ---------------------------------------------------------------------------
-sys.path.insert(0, str(Path(__file__).parent))
-from Create_Charts import (  # noqa: E402
-    create_bar_chart,
-    create_human_subsystem_frequency_chart,
-    create_model_year_chart,
-    compare_LLM_to_NHTSA,
-)
+plt = None  # type: ignore[assignment]  rebound below if matplotlib is available
+create_bar_chart = None  # type: ignore[assignment]
+create_human_subsystem_frequency_chart = None  # type: ignore[assignment]
+create_model_year_chart = None  # type: ignore[assignment]
+compare_LLM_to_NHTSA = None  # type: ignore[assignment]
+_CHART_BACKEND_READY = False
+_CHART_BACKEND_ERROR: str | None = None
+
+try:
+    import matplotlib  # type: ignore[import-not-found]
+    matplotlib.use("Agg")          # must precede "import matplotlib.pyplot as plt"
+    import matplotlib.pyplot as plt  # type: ignore[no-redef]  # noqa: E402
+    # Make Create_Charts.py importable: insert this file's directory at the
+    # front of sys.path so "import Create_Charts" resolves without needing
+    # the caller to manage sys.path. Index 0 wins over any stale package
+    # entries that might shadow local modules.
+    sys.path.insert(0, str(Path(__file__).parent))
+    from Create_Charts import (  # type: ignore[no-redef]  # noqa: E402
+        create_bar_chart,
+        create_human_subsystem_frequency_chart,
+        create_model_year_chart,
+        compare_LLM_to_NHTSA,
+    )
+    _CHART_BACKEND_READY = True
+except ImportError as exc:
+    _CHART_BACKEND_ERROR = str(exc)
+
+
+def _headless_chart_refusal(chart_name: str) -> str:
+    """
+    Return a structured JSON-string refusal that the LLM can read and adapt to,
+    instead of trying to render a chart in an environment that cannot display
+    one. Mirrors the shape of a successful render's return value (a JSON string)
+    so the agentic loop's tool-result parser does not have to special-case this.
+    """
+    payload = {
+        "rendered": False,
+        "chart_name": chart_name,
+        "reason": (
+            "Chart rendering is disabled in this hosted/headless environment. "
+            "There is no display to show a PNG, and matplotlib is not installed "
+            "on the server. Describe the data in prose instead, or call a data "
+            "tool (filter_rows, filter_csv, etc.) to fetch the underlying numbers."
+        ),
+    }
+    return json.dumps(payload)
 
 # ---------------------------------------------------------------------------
 # Project-level path constants (resolved at import time so tools don't need
@@ -279,6 +331,8 @@ def create_bar_chart_tool(columns: list[str]) -> str:
           }
     """
     chart_name = "create_bar_chart"
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return _headless_chart_refusal(chart_name)
     csv_path = OUTPUTS_DIR / "Specific_Subsystem_Prompt.csv"
 
     # --- call underlying chart function ---
@@ -362,6 +416,8 @@ def create_model_year_chart_tool(include_year: bool = False) -> str:
           }
     """
     chart_name = "create_model_year_chart"
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return _headless_chart_refusal(chart_name)
 
     # --- build structured summary before rendering --------------------------
     # We load the parquet to compute the top-5 summary independently so the
@@ -483,6 +539,8 @@ def create_human_subsystem_frequency_chart_tool(
           }
     """
     chart_name = "create_human_subsystem_frequency_chart"
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return _headless_chart_refusal(chart_name)
     filters = filters or {}
     top_n = max(1, min(int(top_n), 30))
 
@@ -625,6 +683,8 @@ def compare_LLM_to_NHTSA_tool() -> str:
           }
     """
     chart_name = "compare_LLM_to_NHTSA"
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return _headless_chart_refusal(chart_name)
     csv_path     = OUTPUTS_DIR / "Specific_Subsystem_Prompt.csv"
 
     # --- build structured summary before rendering --------------------------
