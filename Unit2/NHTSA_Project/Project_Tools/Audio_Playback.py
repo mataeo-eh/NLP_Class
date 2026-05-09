@@ -7,6 +7,7 @@ from Project_Tools.Runtime_Options import (
     is_audio_enabled,
     get_voice_model,
     get_voice_preset,
+    is_headless_mode,
 )
 
 load_dotenv()
@@ -563,6 +564,11 @@ def narrate_progress(text: str) -> None:
     # speak with the same voice as the rest of the pipeline.
     if not text or not text.strip():
         return
+    # Hosted backend: skip narration entirely. Per-node progress is surfaced to
+    # the frontend via the LangGraph stream events emitted by the FastAPI
+    # endpoint, so a second print/TTS channel here is redundant noise.
+    if is_headless_mode():
+        return
     if not is_audio_enabled():
         print(f"[progress] {text}")
         return
@@ -582,6 +588,13 @@ def narrate_node_result(node_name: str, context: dict) -> None:
     # narrate_progress delivers it at a faster pace than the final-answer voice.
     # The entire call is wrapped in try/except — narration is a UX layer and must
     # never crash the pipeline.
+    #
+    # Hosted backend short-circuit: skip the Mercury call AND the TTS step.
+    # Progress is surfaced to the frontend via LangGraph's per-node stream
+    # events, so calling Mercury here would only burn tokens and add latency
+    # without producing any output the user can hear.
+    if is_headless_mode():
+        return
     try:
         # Lazy imports to avoid circular dependencies at module load time.
         # Audio_Playback is imported early in the process; LangGraph.config and Prompts

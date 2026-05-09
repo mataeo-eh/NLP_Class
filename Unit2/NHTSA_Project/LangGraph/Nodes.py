@@ -62,6 +62,10 @@ from Project_Tools.Code_Exec_Tools import code_exec
 # Codebase inspection tools: let the model list and read sections of project
 # source files so it can answer questions about pipeline internals.
 from Project_Tools.Codebase_Tools import list_project_files, read_file_section
+# is_headless_mode is consulted by confirm_csv_write to short-circuit the user
+# yes/no prompt when running on the FastAPI backend. The local CLI never sets
+# headless mode, so its existing prompt-the-user behaviour is preserved.
+from Project_Tools.Runtime_Options import is_headless_mode
 # ---------------------------------------------------------------------------
 # Load environment variables from a .env file
 # ---------------------------------------------------------------------------
@@ -443,6 +447,18 @@ def confirm_csv_write(state: State) -> dict:
     # about a write that wouldn't happen anyway.
     if not analysis or not prompt_name:
         print("[confirm_csv_write] Nothing to write; skipping confirmation prompt.")
+        return {"csv_write_confirmed": False}
+
+    # Hosted backend (FastAPI on Render): there is no human at this process to
+    # answer yes/no, and the user already chose to disable CSV writes server-
+    # side. Short-circuit straight to "not confirmed" so the conditional edge
+    # routes to END instead of csv_append. No TTS, no Mercury narration, no
+    # voice_ask_user — those would all either no-op or block uselessly.
+    if is_headless_mode():
+        print(
+            "[confirm_csv_write] Hosted/headless mode; auto-declining the CSV "
+            "write so the graph exits without touching disk."
+        )
         return {"csv_write_confirmed": False}
 
     # Mercury+TTS narration of the pending write. narrate_node_result feeds

@@ -20,6 +20,12 @@ import subprocess
 
 from langchain_core.tools import tool
 
+# is_headless_mode is consulted at the top of code_exec so the tool refuses
+# to run *any* user-supplied code on the public Render backend. The local CLI
+# is unaffected — it sees is_headless_mode() == False and falls through to
+# the existing y/n stdin gate.
+from Project_Tools.Runtime_Options import is_headless_mode
+
 
 @tool
 def code_exec(code: str, reason: str) -> str:
@@ -58,6 +64,25 @@ def code_exec(code: str, reason: str) -> str:
         On denial returns the literal string:
           "User denied execution. Choose a different tool or ask the user what they prefer."
     """
+    # -------------------------------------------------------------------------
+    # Hosted backend safety gate.
+    #
+    # On the public Render deployment the y/n stdin prompt below is meaningless:
+    # there is no human at stdin to approve, and even if there were, the caller
+    # of the API is whoever hits /run, not the project owner. Allowing arbitrary
+    # Python execution on a public web server with only a UI gate would let any
+    # caller read environment variables (API keys), touch the filesystem, and
+    # make outbound network calls. Until the tool runs inside a real sandbox
+    # (Vercel Sandbox, e2b, gVisor microVM, etc.), the only safe behaviour in
+    # hosted mode is a hard refusal. The local CLI is unaffected.
+    # -------------------------------------------------------------------------
+    if is_headless_mode():
+        return (
+            "code_exec is disabled in this hosted environment because arbitrary "
+            "Python execution on a public server is not safe without a sandbox. "
+            "Choose a different tool or describe the answer in prose."
+        )
+
     # -------------------------------------------------------------------------
     # Step 1: Show the user what is about to run and why.
     # We print to stdout (not TTS) because Y/N is a synchronous binary decision;

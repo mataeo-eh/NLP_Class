@@ -17,6 +17,21 @@ optional audio stack.
 
 _AUDIO_ENABLED = False
 
+# Headless mode flag — set to True by the FastAPI backend at startup so every
+# tool that would normally interact with the user (voice_ask_user, code_exec,
+# confirm_csv_write, narrate_node_result, etc.) can short-circuit safely.
+#
+# Why this exists separately from _AUDIO_ENABLED:
+#   - _AUDIO_ENABLED says "should we use mic + speakers vs. terminal text I/O?"
+#   - _HEADLESS_MODE says "is there a human at this process at all?"
+#
+# The local CLI runs with audio disabled but still has a human at stdin who
+# can answer voice_ask_user prompts via input(). On Render there is no stdin,
+# no human, no mic, no speakers — every interactive tool must instead return a
+# polite refusal string the LLM can read and adapt to. _HEADLESS_MODE is the
+# single source of truth for that distinction.
+_HEADLESS_MODE = False
+
 # Voice-model selector — chosen once at process start by the LangGraph CLI and
 # read by Audio_Playback.generate_TTS_audio on every TTS call. The selector is a
 # short, user-facing key; the concrete model path / model id for each engine is
@@ -94,6 +109,28 @@ def set_audio_enabled(enabled: bool) -> None:
 def is_audio_enabled() -> bool:
     """Return True when this process should use STT/TTS instead of text I/O."""
     return _AUDIO_ENABLED
+
+
+def set_headless_mode(enabled: bool) -> None:
+    """
+    Mark this process as having no human at stdin / mic / speakers.
+
+    The FastAPI backend calls set_headless_mode(True) at startup so every
+    interactive tool short-circuits to a polite refusal instead of blocking on
+    input() or trying to drive an audio device that does not exist on Render.
+    The local CLI never calls this and so always sees the default (False).
+    """
+    global _HEADLESS_MODE
+    _HEADLESS_MODE = bool(enabled)
+
+
+def is_headless_mode() -> bool:
+    """
+    Return True when this process is running without a human (e.g. the FastAPI
+    backend on Render). Tools that would normally block on user input use this
+    to decide whether to ask the user or return a structured refusal string.
+    """
+    return _HEADLESS_MODE
 
 
 def set_voice_model(model: str) -> None:
