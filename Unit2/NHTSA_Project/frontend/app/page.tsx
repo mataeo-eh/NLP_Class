@@ -550,7 +550,9 @@ export default function HomePage() {
 
       setRequest(transcript);
       appendLog(`[transcript] ${transcript}`);
-      setAssistantStatus("Transcript ready. Edit it or send it.");
+      appendLog("[audio] sending transcript directly to /run");
+      setAssistantStatus("Transcript captured. Sending it to the pipeline...");
+      await runPipelineRequest(transcript);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       appendLog(`transcribe failed: ${message}`);
@@ -696,6 +698,12 @@ export default function HomePage() {
   }
 
   async function handleSendMessage() {
+    await runPipelineRequest(request);
+  }
+
+  async function runPipelineRequest(userRequest: string) {
+    const trimmedRequest = userRequest.trim();
+
     if (!backendBaseUrl) {
       appendLog(
         "NEXT_PUBLIC_API_BASE_URL is not configured, so the frontend does not know which backend to call.",
@@ -706,7 +714,7 @@ export default function HomePage() {
       setAssistantStatus("Run the warmup greeting first.");
       return;
     }
-    if (request.trim().length === 0) {
+    if (trimmedRequest.length === 0) {
       setAssistantStatus("Type a message or record one before sending.");
       return;
     }
@@ -729,7 +737,7 @@ export default function HomePage() {
       const response = await fetch(`${backendBaseUrl}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_request: request.trim() }),
+        body: JSON.stringify({ user_request: trimmedRequest }),
         signal: controller.signal,
       });
 
