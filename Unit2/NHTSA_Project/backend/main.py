@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 from uuid import uuid4
 
@@ -53,6 +54,10 @@ from pydantic import BaseModel, Field
 # missing dependency, malformed graph) shows up immediately in the uvicorn
 # logs rather than the first time a user hits /run.
 from pipeline_runner import WELCOME_TTS_TEXT, encode_sse, stream_pipeline
+from LLM_Tools.MCP_To_Tools import (
+    build_default_mcp_tool_manager,
+    set_global_mcp_tool_manager,
+)
 from audio_io import (
     MAX_AUDIO_UPLOAD_BYTES,
     _DEEPGRAM_CHANNELS,
@@ -148,6 +153,35 @@ def _state_is_resumable_agentic(state: dict[str, Any]) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# FastAPI lifespan.
+#
+# The hosted RMCP statistical backend is a shared async resource. FastAPI's
+# lifespan hook is the right place to create the long-lived MCP session once at
+# startup and tear it down once at shutdown.
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    mcp_manager = build_default_mcp_tool_manager()
+    set_global_mcp_tool_manager(mcp_manager)
+    try:
+        await mcp_manager.startup(loop=asyncio.get_running_loop())
+        app.state.rmcp_status = mcp_manager.describe_status()
+        yield
+    finally:
+        app.state.rmcp_status = {
+            "configured_servers": [],
+            "connected_servers": [],
+            "wrapped_tool_count": 0,
+            "wrapped_tools": [],
+            "startup_errors": {"shutdown": "RMCP manager is offline."},
+        }
+        try:
+            await mcp_manager.shutdown()
+        finally:
+            set_global_mcp_tool_manager(None)
+
+
+# ---------------------------------------------------------------------------
 # FastAPI app instance.
 # ---------------------------------------------------------------------------
 app = FastAPI(
@@ -158,7 +192,8 @@ app = FastAPI(
         "frontend via Server-Sent Events. The /audio/* endpoints provide "
         "browser-native speech-to-text and text-to-speech I/O."
     ),
-    version="0.3.0",
+    version="0.4.0",
+    lifespan=lifespan,
 )
 
 
@@ -293,12 +328,25 @@ async def read_root() -> dict[str, str]:
 
 
 @app.get("/health")
-async def healthcheck() -> dict[str, str]:
+async def healthcheck() -> dict[str, Any]:
     """
     Lightweight liveness probe for Railway's healthcheck system. Returning a
     static 200 OK is sufficient — Railway only cares about the status code.
     """
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "rmcp": getattr(
+            app.state,
+            "rmcp_status",
+            {
+                "configured_servers": [],
+                "connected_servers": [],
+                "wrapped_tool_count": 0,
+                "wrapped_tools": [],
+                "startup_errors": {"manager": "RMCP status has not been initialised."},
+            },
+        ),
+    }
 
 
 @app.post("/session/warmup", response_model=WarmupResponse)

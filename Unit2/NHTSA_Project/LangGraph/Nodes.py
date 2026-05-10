@@ -31,12 +31,22 @@ from config import mercury_llm, gpt5_4_mini_llm, gpt5_1_llm
 from LLM_Tools.NHTSA_Query_Tools import (
     get_rows_by_position,
     filter_rows,
+    count_complaints,
+    group_complaints,
+    summarize_complaints,
+    build_complaint_stats_dataset,
     list_csv_files,
     get_csv_schema,
     filter_csv,
     get_csv_rows_by_position,
     Ask_User,
     User_Answer,
+)
+from LLM_Tools.MCP_To_Tools import (
+    describe_stats_dataset,
+    get_global_mcp_tool_manager,
+    list_stats_datasets,
+    rmcp_status,
 )
 # Reuse the proven CSV-writing helpers from the original main script. These
 # already implement per-file locking (thread-safe), header creation on first
@@ -59,6 +69,8 @@ from Project_Tools.Chart_Tools import (
     create_bar_chart_tool,
     create_model_year_chart_tool,
     create_human_subsystem_frequency_chart_tool,
+    compare_csv_to_parquet_labels,
+    build_csv_parquet_label_stats_dataset,
     compare_LLM_to_NHTSA_tool,
     describe_chart_data,
     cleanup_temp_charts,
@@ -147,6 +159,50 @@ def _serialise_agentic_messages(messages: list[Any]) -> list[dict]:
     messages_from_dict(...) on the next follow-up run.
     """
     return messages_to_dict(list(messages))
+
+
+def _build_agentic_tool_binding(local_tools: list[Any]) -> tuple[list[Any], dict[str, Any], set[str], Any]:
+    """
+    Combine local LangChain tools with any wrapped RMCP statistical tools.
+
+    The remote RMCP surface is optional at runtime. If the hosted stats server
+    failed startup or is disabled, the agent still receives the local tools and
+    can continue with exact parquet queries, comparisons, and narration.
+    """
+    tool_map = {tool_obj.name: tool_obj for tool_obj in local_tools}
+    bound_tools = list(local_tools)
+    mcp_manager = get_global_mcp_tool_manager()
+    remote_tool_names: set[str] = set()
+
+    if mcp_manager is not None:
+        wrapped_tools = mcp_manager.get_wrapped_openai_tools()
+        if wrapped_tools:
+            bound_tools.extend(wrapped_tools)
+            remote_tool_names = mcp_manager.get_wrapped_tool_names()
+
+    return bound_tools, tool_map, remote_tool_names, mcp_manager
+
+
+def _invoke_agentic_tool(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    *,
+    tool_map: dict[str, Any],
+    remote_tool_names: set[str],
+    mcp_manager: Any,
+) -> str:
+    """
+    Execute either a local LangChain tool or a wrapped remote RMCP tool.
+
+    Wrapped RMCP tools keep their original remote names, so this helper is the
+    single source of truth for deciding whether a tool call stays local or is
+    forwarded to the hosted statistics backend.
+    """
+    if tool_name in tool_map:
+        return str(tool_map[tool_name].invoke(tool_args))
+    if mcp_manager is not None and tool_name in remote_tool_names:
+        return str(mcp_manager.execute_tool_call_sync(tool_name, tool_args))
+    raise ValueError(f"unknown tool {tool_name!r}")
 
 
 
@@ -747,9 +803,10 @@ def agentic_analyze(state: State) -> dict:
     # MODEL: gpt5_1_llm (the strongest reasoning + tool orchestration model in
     # this pipeline). Same model used by the retrieve_data node's LLM binding.
     #
-    # TOOLS: All six NHTSA query tools (same set as retrieve_data) plus
-    # voice_ask_user for mid-loop clarification. Chart tools and code execution
-    # tools are intentionally excluded — this node's output is spoken, not visual.
+    # TOOLS: Complaint row-preview tools, exact whole-dataset aggregation tools,
+    # CSV inspection tools, and voice_ask_user for mid-loop clarification.
+    # Chart tools and code execution are intentionally excluded — this node's
+    # output is spoken, not visual.
     #
     # PARALLEL DISPATCH: When the model emits multiple tool_calls in one turn,
     # all are submitted concurrently via ThreadPoolExecutor. This mirrors the
@@ -786,22 +843,31 @@ def agentic_analyze(state: State) -> dict:
     )
 
     # All tools available to this node. voice_ask_user enables mid-loop TTS
-    # clarification. No chart or code-execution tools — output is spoken JSON.
+    # clarification. The dedicated CSV-to-parquet comparison tool is allowed
+    # because it returns structured data only; no charts or code execution.
     tool_list = [
         get_rows_by_position,
         filter_rows,
+        count_complaints,
+        group_complaints,
+        summarize_complaints,
+        build_complaint_stats_dataset,
+        compare_csv_to_parquet_labels,
+        build_csv_parquet_label_stats_dataset,
         list_csv_files,
         get_csv_schema,
         filter_csv,
         get_csv_rows_by_position,
+        rmcp_status,
+        list_stats_datasets,
+        describe_stats_dataset,
         voice_ask_user,
     ]
-    # Dict keyed by tool name for O(1) dispatch inside the loop.
-    tool_map = {t.name: t for t in tool_list}
+    bound_tools, tool_map, remote_tool_names, mcp_manager = _build_agentic_tool_binding(tool_list)
 
     # Bind tools to the model. This adds the tool schema to the model's context
     # so it knows how to structure tool_call dicts in its responses.
-    llm = gpt5_1_llm.bind_tools(tool_list)
+    llm = gpt5_1_llm.bind_tools(bound_tools)
 
     # Higher cap than retrieve_data (8) because exploration + verdict composition
     # needs more turns than pure row retrieval.
@@ -850,8 +916,7 @@ def agentic_analyze(state: State) -> dict:
         with ThreadPoolExecutor(max_workers=max(1, len(tool_calls))) as executor:
             futures = {}
             for tc in tool_calls:
-                tool = tool_map.get(tc["name"])
-                if tool is None:
+                if tc["name"] not in tool_map and tc["name"] not in remote_tool_names:
                     # Unknown tool — return an error immediately without a future.
                     # Appending now (before as_completed) is safe because the
                     # executor hasn't yielded this tc in any future.
@@ -860,7 +925,14 @@ def agentic_analyze(state: State) -> dict:
                         tool_call_id=tc["id"],
                     ))
                     continue
-                futures[executor.submit(tool.invoke, tc["args"])] = tc
+                futures[executor.submit(
+                    _invoke_agentic_tool,
+                    tc["name"],
+                    tc["args"],
+                    tool_map=tool_map,
+                    remote_tool_names=remote_tool_names,
+                    mcp_manager=mcp_manager,
+                )] = tc
 
             # Collect results as they complete (order not guaranteed, which is fine —
             # each ToolMessage carries its tool_call_id for the model to correlate).
@@ -976,12 +1048,14 @@ def agentic_explore(state: State) -> dict:
     )
 
     # Full tool list for explore: chart rendering + narration, code execution
-    # (with user permission gate), codebase inspection, voice dialogue, and all
-    # six NHTSA query tools for data access. 14 tools total.
+    # (with user permission gate), codebase inspection, voice dialogue, sample
+    # row tools, exact whole-dataset aggregate tools, and CSV query tools.
     tool_list = [
         create_bar_chart_tool,
         create_model_year_chart_tool,
         create_human_subsystem_frequency_chart_tool,
+        compare_csv_to_parquet_labels,
+        build_csv_parquet_label_stats_dataset,
         compare_LLM_to_NHTSA_tool,
         describe_chart_data,
         code_exec,
@@ -990,18 +1064,24 @@ def agentic_explore(state: State) -> dict:
         voice_ask_user,
         get_rows_by_position,
         filter_rows,
+        count_complaints,
+        group_complaints,
+        summarize_complaints,
+        build_complaint_stats_dataset,
         list_csv_files,
         get_csv_schema,
         filter_csv,
         get_csv_rows_by_position,
+        rmcp_status,
+        list_stats_datasets,
+        describe_stats_dataset,
     ]
-    # Dict keyed by tool name for O(1) dispatch inside the loop.
-    tool_map = {t.name: t for t in tool_list}
+    bound_tools, tool_map, remote_tool_names, mcp_manager = _build_agentic_tool_binding(tool_list)
 
     # Bind tools to the mini model. Lower latency than gpt5_1_llm matters here
     # because the user is in a real-time spoken dialogue and perceives each
     # model turn as a pause before TTS plays.
-    llm = gpt5_4_mini_llm.bind_tools(tool_list)
+    llm = gpt5_4_mini_llm.bind_tools(bound_tools)
 
     # Higher cap than retrieve_data (8) because conversational exploration
     # can require many chart + narration + follow-up cycles.
@@ -1051,8 +1131,7 @@ def agentic_explore(state: State) -> dict:
         with ThreadPoolExecutor(max_workers=max(1, len(tool_calls))) as executor:
             futures = {}
             for tc in tool_calls:
-                tool = tool_map.get(tc["name"])
-                if tool is None:
+                if tc["name"] not in tool_map and tc["name"] not in remote_tool_names:
                     # Unknown tool — return an error immediately without a future.
                     # Appending now (before as_completed) is safe because the
                     # executor hasn't yielded this tc in any future.
@@ -1061,7 +1140,14 @@ def agentic_explore(state: State) -> dict:
                         tool_call_id=tc["id"],
                     ))
                     continue
-                futures[executor.submit(tool.invoke, tc["args"])] = tc
+                futures[executor.submit(
+                    _invoke_agentic_tool,
+                    tc["name"],
+                    tc["args"],
+                    tool_map=tool_map,
+                    remote_tool_names=remote_tool_names,
+                    mcp_manager=mcp_manager,
+                )] = tc
 
             # Collect results as they complete (order not guaranteed, which is fine —
             # each ToolMessage carries its tool_call_id for the model to correlate).

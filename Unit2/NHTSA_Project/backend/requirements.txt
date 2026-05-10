@@ -24,6 +24,9 @@ python-multipart>=0.0.20
 langgraph>=1.0,<2.0
 langchain-core>=1.0,<2.0
 langchain-openai>=1.0,<2.0
+# Official Python MCP SDK client for connecting the hosted backend to remote
+# RMCP statistical tools over Streamable HTTP without running local R compute.
+mcp>=1.0,<2.0
 
 # --- Data layer -------------------------------------------------------------
 # pandas reads NHTSA/complaints_cleaned.parquet at request time. pyarrow is

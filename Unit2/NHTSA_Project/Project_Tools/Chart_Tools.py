@@ -47,10 +47,14 @@ import platform
 import subprocess
 import sys
 import tempfile
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 
 from langchain_core.tools import tool
+
+from LLM_Tools.MCP_To_Tools import register_stats_dataset
 
 # is_headless_mode is consulted at the top of every chart @tool so the FastAPI
 # backend never touches matplotlib at all — the server has no display and no
@@ -644,6 +648,525 @@ def create_human_subsystem_frequency_chart_tool(
     })
 
 
+def _build_csv_parquet_label_comparison(
+    *,
+    filename: str,
+    llm_label_column: str,
+    parquet_label_column: str,
+    index_column: str,
+    complaint_text_column: str,
+    top_n: int,
+    example_limit: int,
+) -> dict:
+    """Compute an exact CSV-to-parquet label comparison summary.
+
+    This helper is shared by the data-first comparison tool and the existing
+    chart tool so both surfaces use identical join logic, label normalization,
+    and agreement definitions.
+    """
+    import ast
+    import pandas as pd
+    import numpy as np
+
+    csv_path = OUTPUTS_DIR / filename
+    summary: dict = {
+        "filename": filename,
+        "join": {
+            "index_column": index_column,
+            "llm_label_column": llm_label_column,
+            "parquet_label_column": parquet_label_column,
+        },
+        "compared_rows": 0,
+        "skipped_rows": {
+            "missing_index": 0,
+            "missing_parquet_row": 0,
+            "missing_csv_label_column": 0,
+            "missing_parquet_label_column": 0,
+        },
+        "agreement_counts": {"full": 0, "partial": 0, "none": 0},
+        "percentages": {"full": 0.0, "partial": 0.0, "none": 0.0},
+        "label_metrics": {
+            "true_positive_labels": 0,
+            "false_positive_labels": 0,
+            "false_negative_labels": 0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+        },
+        "top_human_label_accuracy": [],
+        "top_confused_pairs": [],
+        "examples": {"full": [], "partial": [], "none": []},
+    }
+
+    if not csv_path.exists():
+        summary["error"] = f"CSV file '{filename}' was not found in the Outputs directory."
+        return summary
+
+    try:
+        csv_df = pd.read_csv(csv_path)
+        pq_df = pd.read_parquet(PARQUET_PATH)
+    except Exception as exc:
+        summary["error"] = str(exc)
+        return summary
+
+    required_csv_columns = [index_column, llm_label_column]
+    missing_csv_columns = [col for col in required_csv_columns if col not in csv_df.columns]
+    if missing_csv_columns:
+        summary["error"] = (
+            "CSV file is missing one or more required columns for comparison."
+        )
+        summary["missing_csv_columns"] = missing_csv_columns
+        return summary
+
+    if parquet_label_column not in pq_df.columns:
+        summary["error"] = (
+            f"Parquet column '{parquet_label_column}' was not found in complaints_cleaned.parquet."
+        )
+        return summary
+
+    top_n = max(1, min(int(top_n), 25))
+    example_limit = max(0, min(int(example_limit), 10))
+
+    def _coerce_index(raw_value) -> int | None:
+        if raw_value is None:
+            return None
+        text_value = str(raw_value).strip()
+        if not text_value:
+            return None
+        try:
+            return int(text_value)
+        except ValueError:
+            try:
+                return int(float(text_value))
+            except ValueError:
+                return None
+
+    def _normalize_labels(raw_value, *, parse_string_literal: bool) -> frozenset[str]:
+        if raw_value is None:
+            return frozenset()
+        if isinstance(raw_value, np.ndarray):
+            values = raw_value.tolist()
+        elif isinstance(raw_value, (list, tuple, set)):
+            values = list(raw_value)
+        elif isinstance(raw_value, str):
+            text_value = raw_value.strip()
+            if not text_value:
+                return frozenset()
+            if parse_string_literal:
+                try:
+                    parsed = ast.literal_eval(text_value)
+                except (ValueError, SyntaxError):
+                    parsed = [text_value]
+            else:
+                parsed = [text_value]
+
+            if isinstance(parsed, np.ndarray):
+                values = parsed.tolist()
+            elif isinstance(parsed, (list, tuple, set)):
+                values = list(parsed)
+            elif parsed is None:
+                values = []
+            else:
+                values = [parsed]
+        else:
+            values = [raw_value]
+
+        cleaned = []
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, float) and pd.isna(value):
+                continue
+            text_value = str(value).strip().upper()
+            if text_value:
+                cleaned.append(text_value)
+        return frozenset(cleaned)
+
+    def _llm_label_matches_nhtsa_set(llm_label: str, nhtsa_set: frozenset[str]) -> bool:
+        for nhtsa_label in nhtsa_set:
+            if llm_label == nhtsa_label:
+                return True
+            if nhtsa_label.startswith(llm_label + ":") or nhtsa_label.startswith(llm_label + "/"):
+                return True
+        return False
+
+    def _nhtsa_label_matched_by_llm(nhtsa_label: str, llm_set: frozenset[str]) -> bool:
+        for llm_label in llm_set:
+            if nhtsa_label == llm_label:
+                return True
+            if nhtsa_label.startswith(llm_label + ":") or nhtsa_label.startswith(llm_label + "/"):
+                return True
+        return False
+
+    human_label_stats: dict[str, dict[str, int]] = {}
+    miss_pairs: Counter[tuple[str, str]] = Counter()
+    tp_labels = fp_labels = fn_labels = 0
+
+    for _, row in csv_df.iterrows():
+        df_index = _coerce_index(row.get(index_column))
+        if df_index is None:
+            summary["skipped_rows"]["missing_index"] += 1
+            continue
+        if df_index not in pq_df.index:
+            summary["skipped_rows"]["missing_parquet_row"] += 1
+            continue
+
+        llm_set = _normalize_labels(row.get(llm_label_column), parse_string_literal=True)
+        nhtsa_set = _normalize_labels(
+            pq_df.at[df_index, parquet_label_column],
+            parse_string_literal=False,
+        )
+
+        if not llm_set:
+            summary["skipped_rows"]["missing_csv_label_column"] += 1
+            continue
+        if not nhtsa_set:
+            summary["skipped_rows"]["missing_parquet_label_column"] += 1
+            continue
+
+        matched_human = {
+            label for label in nhtsa_set if _nhtsa_label_matched_by_llm(label, llm_set)
+        }
+        matched_llm = {
+            label for label in llm_set if _llm_label_matches_nhtsa_set(label, nhtsa_set)
+        }
+
+        tp_labels += len(matched_human)
+        fn_labels += len(nhtsa_set - matched_human)
+        fp_labels += len(llm_set - matched_llm)
+
+        for nhtsa_label in nhtsa_set:
+            stats = human_label_stats.setdefault(nhtsa_label, {"total": 0, "matched": 0})
+            stats["total"] += 1
+            if nhtsa_label in matched_human:
+                stats["matched"] += 1
+
+        if llm_set == nhtsa_set:
+            outcome = "full"
+        elif matched_human:
+            outcome = "partial"
+        else:
+            outcome = "none"
+            for nhtsa_label in nhtsa_set:
+                for llm_label in llm_set:
+                    miss_pairs[(nhtsa_label, llm_label)] += 1
+
+        summary["agreement_counts"][outcome] += 1
+        summary["compared_rows"] += 1
+
+        if len(summary["examples"][outcome]) < example_limit:
+            complaint_text = ""
+            if complaint_text_column in pq_df.columns:
+                raw_text = pq_df.at[df_index, complaint_text_column]
+                complaint_text = "" if raw_text is None else str(raw_text)
+            summary["examples"][outcome].append(
+                {
+                    "df_index": int(df_index),
+                    "human_labels": sorted(nhtsa_set),
+                    "llm_labels": sorted(llm_set),
+                    "complaint_text": complaint_text,
+                }
+            )
+
+    compared = summary["compared_rows"]
+    if compared > 0:
+        for key, count in summary["agreement_counts"].items():
+            summary["percentages"][key] = round(count / compared * 100, 1)
+
+    precision = tp_labels / (tp_labels + fp_labels) if (tp_labels + fp_labels) else 0.0
+    recall = tp_labels / (tp_labels + fn_labels) if (tp_labels + fn_labels) else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall)
+        else 0.0
+    )
+    summary["label_metrics"] = {
+        "true_positive_labels": tp_labels,
+        "false_positive_labels": fp_labels,
+        "false_negative_labels": fn_labels,
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "f1": round(f1, 4),
+    }
+
+    label_accuracy = []
+    for label, stats in human_label_stats.items():
+        total = stats["total"]
+        matched = stats["matched"]
+        label_accuracy.append(
+            {
+                "label": label,
+                "total": total,
+                "matched": matched,
+                "missed": total - matched,
+                "accuracy_pct": round(matched / total * 100, 1) if total else 0.0,
+            }
+        )
+    label_accuracy.sort(key=lambda item: (-item["total"], item["label"]))
+    summary["top_human_label_accuracy"] = label_accuracy[:top_n]
+    summary["top_confused_pairs"] = [
+        {"nhtsa_label": nhtsa_label, "llm_label": llm_label, "count": count}
+        for (nhtsa_label, llm_label), count in miss_pairs.most_common(top_n)
+    ]
+
+    return summary
+
+
+def _to_stats_cell(value):
+    """Convert one comparison cell into a scalar JSON value for RMCP datasets."""
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set)):
+        return json.dumps(list(value), default=str)
+    try:
+        import numpy as np
+        import pandas as pd
+
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, float) and pd.isna(value):
+            return None
+    except Exception:
+        pass
+    return value
+
+
+@tool
+def compare_csv_to_parquet_labels(
+    filename: str = "Specific_Subsystem_Prompt.csv",
+    llm_label_column: str = "subsystems",
+    parquet_label_column: str = "COMPDESC",
+    index_column: str = "df_index",
+    complaint_text_column: str = "CDESCR",
+    top_n: int = 10,
+    example_limit: int = 5,
+) -> str:
+    """Compare CSV labels against human parquet labels via the stored row index.
+
+    Use this for exact parquet-to-CSV evaluation. It scans every row in the CSV,
+    joins back to the parquet on df_index, and returns exact agreement counts,
+    precision/recall/F1, per-label accuracy, confusion pairs, and example rows.
+    """
+    summary = _build_csv_parquet_label_comparison(
+        filename=filename,
+        llm_label_column=llm_label_column,
+        parquet_label_column=parquet_label_column,
+        index_column=index_column,
+        complaint_text_column=complaint_text_column,
+        top_n=top_n,
+        example_limit=example_limit,
+    )
+    return json.dumps(summary, indent=2)
+
+
+@tool
+def build_csv_parquet_label_stats_dataset(
+    filename: str = "Specific_Subsystem_Prompt.csv",
+    llm_label_column: str = "subsystems",
+    parquet_label_column: str = "COMPDESC",
+    index_column: str = "df_index",
+    include_parquet_columns: list[str] | None = None,
+) -> str:
+    """
+    Store an exact CSV-to-parquet comparison table server-side for RMCP stats tools.
+
+    The returned dataset contains one row per compared complaint plus derived
+    agreement features. Use the returned `dataset_id` with wrapped RMCP tools
+    such as chi_square_test, t_test, anova, or correlation_analysis.
+    """
+    import ast
+    import pandas as pd
+
+    csv_path = OUTPUTS_DIR / filename
+    if not csv_path.exists():
+        return json.dumps(
+            {"error": f"CSV file '{filename}' was not found in the Outputs directory."},
+            indent=2,
+        )
+
+    csv_df = pd.read_csv(csv_path)
+    pq_df = pd.read_parquet(PARQUET_PATH)
+    include_parquet_columns = [
+        column for column in dict.fromkeys(include_parquet_columns or []) if column
+    ]
+
+    required_csv_columns = [index_column, llm_label_column]
+    missing_csv_columns = [col for col in required_csv_columns if col not in csv_df.columns]
+    if missing_csv_columns:
+        return json.dumps(
+            {
+                "error": "CSV file is missing one or more required columns for comparison.",
+                "missing_csv_columns": missing_csv_columns,
+            },
+            indent=2,
+        )
+
+    missing_parquet_columns = [
+        col
+        for col in [parquet_label_column, *include_parquet_columns]
+        if col not in pq_df.columns
+    ]
+    if missing_parquet_columns:
+        return json.dumps(
+            {
+                "error": "One or more requested parquet columns were not found.",
+                "missing_parquet_columns": missing_parquet_columns,
+            },
+            indent=2,
+        )
+
+    def _coerce_index(raw_value) -> int | None:
+        if raw_value is None:
+            return None
+        text_value = str(raw_value).strip()
+        if not text_value:
+            return None
+        try:
+            return int(text_value)
+        except ValueError:
+            try:
+                return int(float(text_value))
+            except ValueError:
+                return None
+
+    def _normalize_labels(raw_value, *, parse_string_literal: bool) -> frozenset[str]:
+        if raw_value is None:
+            return frozenset()
+        if isinstance(raw_value, str):
+            text_value = raw_value.strip()
+            if not text_value:
+                return frozenset()
+            if parse_string_literal:
+                try:
+                    parsed = ast.literal_eval(text_value)
+                except (ValueError, SyntaxError):
+                    parsed = [text_value]
+            else:
+                parsed = [text_value]
+        elif isinstance(raw_value, (list, tuple, set)):
+            parsed = list(raw_value)
+        else:
+            parsed = [raw_value]
+
+        cleaned = []
+        for value in parsed:
+            if value is None:
+                continue
+            text_value = str(value).strip().upper()
+            if text_value and text_value != "NAN":
+                cleaned.append(text_value)
+        return frozenset(cleaned)
+
+    def _llm_matches_human(llm_label: str, human_set: frozenset[str]) -> bool:
+        for human_label in human_set:
+            if llm_label == human_label:
+                return True
+            if human_label.startswith(llm_label + ":") or human_label.startswith(llm_label + "/"):
+                return True
+        return False
+
+    def _human_matched_by_llm(human_label: str, llm_set: frozenset[str]) -> bool:
+        for llm_label in llm_set:
+            if human_label == llm_label:
+                return True
+            if human_label.startswith(llm_label + ":") or human_label.startswith(llm_label + "/"):
+                return True
+        return False
+
+    rows: list[dict[str, Any]] = []
+    skipped = {
+        "missing_index": 0,
+        "missing_parquet_row": 0,
+        "missing_csv_label_column": 0,
+        "missing_parquet_label_column": 0,
+    }
+
+    for _, row in csv_df.iterrows():
+        df_index = _coerce_index(row.get(index_column))
+        if df_index is None:
+            skipped["missing_index"] += 1
+            continue
+        if df_index not in pq_df.index:
+            skipped["missing_parquet_row"] += 1
+            continue
+
+        llm_set = _normalize_labels(row.get(llm_label_column), parse_string_literal=True)
+        human_set = _normalize_labels(
+            pq_df.at[df_index, parquet_label_column],
+            parse_string_literal=False,
+        )
+        if not llm_set:
+            skipped["missing_csv_label_column"] += 1
+            continue
+        if not human_set:
+            skipped["missing_parquet_label_column"] += 1
+            continue
+
+        matched_human = {
+            label for label in human_set if _human_matched_by_llm(label, llm_set)
+        }
+        matched_llm = {
+            label for label in llm_set if _llm_matches_human(label, human_set)
+        }
+        false_positive = llm_set - matched_llm
+        false_negative = human_set - matched_human
+
+        if llm_set == human_set:
+            agreement_level = "FULL"
+        elif matched_human:
+            agreement_level = "PARTIAL"
+        else:
+            agreement_level = "NONE"
+
+        union_count = len(human_set | llm_set)
+        overlap_count = len(matched_human)
+        row_payload: dict[str, Any] = {
+            "df_index": int(df_index),
+            "agreement_level": agreement_level,
+            "full_match": int(agreement_level == "FULL"),
+            "partial_match": int(agreement_level == "PARTIAL"),
+            "no_match": int(agreement_level == "NONE"),
+            "human_label_count": len(human_set),
+            "llm_label_count": len(llm_set),
+            "matched_label_count": overlap_count,
+            "false_positive_label_count": len(false_positive),
+            "false_negative_label_count": len(false_negative),
+            "jaccard_similarity": round(overlap_count / union_count, 6) if union_count else 0.0,
+            "human_match_ratio": round(overlap_count / len(human_set), 6) if human_set else 0.0,
+            "llm_match_ratio": round(overlap_count / len(llm_set), 6) if llm_set else 0.0,
+            "human_primary_label": sorted(human_set)[0],
+            "llm_primary_label": sorted(llm_set)[0],
+            "human_labels_joined": " | ".join(sorted(human_set)),
+            "llm_labels_joined": " | ".join(sorted(llm_set)),
+        }
+        for column in include_parquet_columns:
+            row_payload[column] = _to_stats_cell(pq_df.at[df_index, column])
+        rows.append(row_payload)
+
+    if not rows:
+        return json.dumps(
+            {"error": "No comparison rows were available for stats dataset creation.", "skipped_rows": skipped},
+            indent=2,
+        )
+
+    columns = list(rows[0].keys())
+    data = {column: [row[column] for row in rows] for column in columns}
+    manifest = register_stats_dataset(
+        data=data,
+        source="csv_parquet_label_comparison",
+        description="Exact CSV-to-parquet label comparison dataset prepared for hosted statistical tools.",
+        metadata={
+            "filename": filename,
+            "llm_label_column": llm_label_column,
+            "parquet_label_column": parquet_label_column,
+            "index_column": index_column,
+            "include_parquet_columns": include_parquet_columns,
+            "skipped_rows": skipped,
+        },
+    )
+    return json.dumps(manifest, indent=2, default=str)
+
+
 @tool
 def compare_LLM_to_NHTSA_tool() -> str:
     """
@@ -687,85 +1210,15 @@ def compare_LLM_to_NHTSA_tool() -> str:
         return _headless_chart_refusal(chart_name)
     csv_path     = OUTPUTS_DIR / "Specific_Subsystem_Prompt.csv"
 
-    # --- build structured summary before rendering --------------------------
-    # Re-run the agreement classification logic independently so the LLM gets
-    # a structured summary even if the chart function's display path changes.
-    import ast
-    import pandas as pd
-    import numpy as np
-    from collections import Counter
-
-    summary: dict = {
-        "total_complaints": 0,
-        "agreement_counts": {"full": 0, "partial": 0, "none": 0},
-        "percentages": {"full": 0.0, "partial": 0.0, "none": 0.0},
-        "top_5_confused_pairs": [],
-    }
-
-    try:
-        csv_df = pd.read_csv(csv_path)
-        pq_df  = pd.read_parquet(PARQUET_PATH)
-
-        def _normalize(labels):
-            return frozenset(str(l).upper().strip() for l in labels)
-
-        def _llm_matches(llm_label, nhtsa_set):
-            for n in nhtsa_set:
-                if llm_label == n:
-                    return True
-                if n.startswith(llm_label + ":") or n.startswith(llm_label + "/"):
-                    return True
-            return False
-
-        full_agree = partial_agree = no_agree = 0
-        miss_pairs: list[tuple[str, str]] = []
-
-        for _, row in csv_df.iterrows():
-            try:
-                llm_labels = ast.literal_eval(row["subsystems"])
-            except (ValueError, SyntaxError):
-                llm_labels = []
-
-            llm_set   = _normalize(llm_labels)
-            nhtsa_raw = pq_df.loc[row["df_index"], "COMPDESC"]
-            nhtsa_set = _normalize(list(nhtsa_raw))
-
-            if llm_set == nhtsa_set:
-                full_agree += 1
-            else:
-                any_match = any(_llm_matches(l, nhtsa_set) for l in llm_set)
-                if any_match:
-                    partial_agree += 1
-                else:
-                    no_agree += 1
-                    for n in nhtsa_set:
-                        for l in llm_set:
-                            miss_pairs.append((n, l))
-
-        total = full_agree + partial_agree + no_agree
-        summary["total_complaints"] = total
-        summary["agreement_counts"] = {
-            "full": full_agree,
-            "partial": partial_agree,
-            "none": no_agree,
-        }
-        if total > 0:
-            summary["percentages"] = {
-                "full":    round(full_agree    / total * 100, 1),
-                "partial": round(partial_agree / total * 100, 1),
-                "none":    round(no_agree      / total * 100, 1),
-            }
-
-        # Top-5 most frequent (NHTSA label, LLM label) miss pairs.
-        pair_counts = Counter(miss_pairs)
-        top5_pairs = pair_counts.most_common(5)
-        summary["top_5_confused_pairs"] = [
-            {"nhtsa_label": n, "llm_label": l, "count": c}
-            for (n, l), c in top5_pairs
-        ]
-
-    except Exception as e:
-        summary["error"] = str(e)
+    summary = _build_csv_parquet_label_comparison(
+        filename="Specific_Subsystem_Prompt.csv",
+        llm_label_column="subsystems",
+        parquet_label_column="COMPDESC",
+        index_column="df_index",
+        complaint_text_column="CDESCR",
+        top_n=5,
+        example_limit=3,
+    )
 
     _LAST_CHART_DATA[chart_name] = summary
 

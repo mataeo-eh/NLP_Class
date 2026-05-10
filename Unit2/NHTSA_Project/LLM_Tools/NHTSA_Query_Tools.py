@@ -12,7 +12,12 @@ Tool catalogue
 --------------
 Parquet tools:
   get_rows_by_position     — fetch rows by explicit positions or random sample
-  filter_rows              — filter the complaint DB by column equality values
+  filter_rows              — fetch a small preview of matching complaint rows
+  count_complaints         — exact full-dataset row count after filtering
+  group_complaints         — exact full-dataset counts grouped by complaint columns
+  summarize_complaints     — exact descriptive statistics for complaint columns
+  build_complaint_stats_dataset
+                           — exact filtered table stored server-side for RMCP stats tools
 
 CSV tools:
   list_csv_files           — list available CSV output files in Outputs/
@@ -46,6 +51,7 @@ from LangGraph.config import mercury_llm
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from Project_Tools.Runtime_Options import is_audio_enabled
+from LLM_Tools.MCP_To_Tools import register_stats_dataset
 
 # ---------------------------------------------------------------------------
 # File path constants
@@ -173,6 +179,99 @@ def _apply_filter(df: pd.DataFrame, col: str, val) -> pd.DataFrame:
     return df[df[col] == val]
 
 
+def _apply_filters(df: pd.DataFrame, filters: dict | None) -> pd.DataFrame:
+    """Apply zero or more complaint-column filters in sequence."""
+    filters = filters or {}
+    for col, val in filters.items():
+        df = _apply_filter(df, col, val)
+        if df.empty:
+            break
+    return df
+
+
+def _to_json_safe(value):
+    """Convert pandas/numpy scalars into plain JSON-friendly Python values."""
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return value
+
+
+def _to_stats_cell(value):
+    """
+    Convert one DataFrame cell into a scalar value safe for RMCP table schemas.
+
+    RMCP statistical tools expect column-wise arrays of scalar JSON values.
+    Complaint parquet columns can contain list-like cells, so those are encoded
+    as compact JSON strings instead of nested arrays-of-arrays.
+    """
+    safe_value = _to_json_safe(value)
+    if isinstance(safe_value, list):
+        return json.dumps(safe_value, default=str)
+    return safe_value
+
+
+def _series_is_listlike(series: pd.Series) -> bool:
+    """True when the first non-missing cell in the series is list-like."""
+    for value in series:
+        if _is_nan(value):
+            continue
+        return _is_listlike(value)
+    return False
+
+
+def _explode_series_values(series: pd.Series, include_null: bool = False) -> pd.Series:
+    """Flatten scalar or list-like cell values into a single 1-D object series."""
+    values = []
+    for cell in series:
+        if _is_nan(cell):
+            if include_null:
+                values.append(None)
+            continue
+
+        if _is_listlike(cell):
+            iterable = cell.tolist() if isinstance(cell, np.ndarray) else list(cell)
+            if not iterable:
+                if include_null:
+                    values.append(None)
+                continue
+            for item in iterable:
+                if _is_nan(item):
+                    if include_null:
+                        values.append(None)
+                    continue
+                values.append(_to_json_safe(item))
+            continue
+
+        values.append(_to_json_safe(cell))
+
+    return pd.Series(values, dtype="object")
+
+
+def _build_numeric_summary(series: pd.Series) -> dict:
+    """Return a JSON-friendly numeric describe() summary for one series."""
+    described = series.describe(percentiles=[0.25, 0.5, 0.75])
+    summary = {"kind": "numeric"}
+    for key, value in described.items():
+        summary[str(key)] = _to_json_safe(value)
+    return summary
+
+
+def _build_categorical_summary(series: pd.Series) -> dict:
+    """Return a JSON-friendly categorical describe() summary for one series."""
+    described = series.astype("object").describe()
+    summary = {"kind": "categorical"}
+    for key, value in described.items():
+        summary[str(key)] = _to_json_safe(value)
+    return summary
+
+
 # ---------------------------------------------------------------------------
 # Parquet tools
 # ---------------------------------------------------------------------------
@@ -183,31 +282,10 @@ def get_rows_by_position(
     indices: list | None = None,
     fields: list | None = None,
 ) -> str:
-    """
-    Fetch rows from the NHTSA complaints Parquet database by row position.
+    """Fetch complaint rows by exact index or random sample.
 
-    Two modes:
-      - indices provided: fetch those exact 0-based integer row positions.
-        Use this when the user specifies a particular row number (e.g. "show me row 4587").
-      - indices is None: randomly sample `count` rows from the database.
-        Use this when the user asks for examples without specifying positions
-        (e.g. "give me a few sample complaints").
-
-    Parameters
-    ----------
-    count : int
-        Number of rows to randomly sample when indices is not provided. Capped at 10.
-    indices : list of int, optional
-        Explicit 0-based row positions to fetch. If provided, count is ignored.
-        Capped at 10 entries.
-    fields : list of str, optional
-        Column names to include in the result. If None, all non-NaN columns
-        are returned for each row.
-
-    Returns
-    -------
-    str
-        JSON array of row objects. Each object contains only non-NaN field values.
+    Use this to read complaint text or inspect specific examples. This is a row
+    preview tool, not a whole-dataset statistics tool. Results are capped at 10 rows.
     """
     # Use column projection when specific fields are requested to reduce RAM load.
     # When fields=None, all 49 columns are returned, so no projection is applied.
@@ -240,31 +318,11 @@ def filter_rows(
     limit: int = 5,
     fields: list | None = None,
 ) -> str:
-    """
-    Filter the NHTSA complaints Parquet database by column equality values.
+    """Return a small preview of complaint rows matching equality filters.
 
-    Supports all 49 complaint columns. The COMPDESC column is list-typed (a single
-    complaint can span multiple components after deduplication). Filtering on COMPDESC
-    checks whether the value appears anywhere in that list, e.g.
-    filters={"COMPDESC": "ENGINE COOLING SYSTEM"} returns complaints where
-    ENGINE COOLING SYSTEM is one of the listed component categories.
-
-    Parameters
-    ----------
-    filters : dict
-        Column-to-value equality filters. Values can be strings or numbers. Examples:
-          {"MAKETXT": "TOYOTA", "CRASH": "Y"}
-          {"COMPDESC": "SERVICE BRAKES", "YEARTXT": 2023}
-          {"FIRE": "Y", "DEATHS": 1}
-    limit : int
-        Maximum number of matching rows to return. Capped at 10.
-    fields : list of str, optional
-        Columns to include in each result row. If None, all non-NaN columns returned.
-
-    Returns
-    -------
-    str
-        JSON array of matching row objects, or a message if no matches were found.
+    Use this when you need example complaints or complaint text after applying
+    filters. This tool only returns the first few matching rows and must not be
+    used to infer exact whole-dataset counts, modes, or distributions.
     """
     # Load only the columns needed: filter columns + result fields.
     # When fields=None, load everything since we don't know which columns are wanted.
@@ -276,12 +334,10 @@ def filter_rows(
 
     df = pd.read_parquet(PARQUET_PATH, columns=cols_to_load)
 
-    # Apply each equality filter in sequence, short-circuiting on empty result
-    for col, val in filters.items():
-        df = _apply_filter(df, col, val)
-        if df.empty:
-            del df
-            return json.dumps({"result": "No matching rows found for the given filters."})
+    df = _apply_filters(df, filters)
+    if df.empty:
+        del df
+        return json.dumps({"result": "No matching rows found for the given filters."})
 
     cap = min(limit, MAX_ROWS)
     # Preserve df.index so _rows_to_json can attach the original parquet row
@@ -293,6 +349,301 @@ def filter_rows(
         return json.dumps({"result": "No matching rows found for the given filters."})
 
     return _rows_to_json(result_df, fields)
+
+
+@tool
+def count_complaints(filters: dict | None = None) -> str:
+    """Return the exact number of complaints matching filters across the full parquet database.
+
+    Use this for exact whole-dataset counts. Unlike filter_rows, this scans all
+    matching complaints and returns a count instead of sample rows.
+    """
+    filters = filters or {}
+    cols_to_load = list(filters.keys()) if filters else None
+    df = pd.read_parquet(PARQUET_PATH, columns=cols_to_load)
+    total_rows = int(len(df))
+    filtered = _apply_filters(df, filters)
+    matching_rows = int(len(filtered))
+    del df
+    del filtered
+
+    share = (matching_rows / total_rows) if total_rows else 0.0
+    return json.dumps(
+        {
+            "filters": filters,
+            "matching_rows": matching_rows,
+            "total_rows": total_rows,
+            "share_of_dataset": round(share, 6),
+        },
+        default=str,
+        indent=2,
+    )
+
+
+@tool
+def group_complaints(
+    group_by: list[str],
+    filters: dict | None = None,
+    top_n: int = 25,
+    include_null: bool = False,
+    ascending: bool = False,
+) -> str:
+    """Return exact full-dataset counts grouped by complaint columns.
+
+    Use this for questions like "what is the most common year/state/make among
+    all engine complaints?" Unlike filter_rows, this computes exact aggregate
+    counts over all matching complaints. Single list-like columns such as
+    COMPDESC are exploded before counting.
+    """
+    filters = filters or {}
+    group_by = [col for col in dict.fromkeys(group_by or []) if col]
+    if not group_by:
+        return json.dumps({"error": "group_by must contain at least one complaint column name."})
+
+    top_n = max(1, min(int(top_n), 100))
+    cols_to_load = list(dict.fromkeys(list(filters.keys()) + group_by))
+    df = pd.read_parquet(PARQUET_PATH, columns=cols_to_load)
+    filtered = _apply_filters(df, filters)
+    matching_rows = int(len(filtered))
+
+    missing = [col for col in group_by if col not in filtered.columns]
+    if missing:
+        del df
+        del filtered
+        return json.dumps(
+            {
+                "error": "One or more group_by columns were not found.",
+                "missing_columns": missing,
+            },
+            indent=2,
+        )
+
+    if matching_rows == 0:
+        del df
+        del filtered
+        return json.dumps(
+            {
+                "filters": filters,
+                "group_by": group_by,
+                "matching_rows": 0,
+                "distinct_groups": 0,
+                "groups": [],
+            },
+            indent=2,
+        )
+
+    listlike_group_cols = [col for col in group_by if _series_is_listlike(filtered[col])]
+    if listlike_group_cols and len(group_by) > 1:
+        del df
+        del filtered
+        return json.dumps(
+            {
+                "error": (
+                    "group_complaints only supports list-like grouping when exactly one "
+                    "group_by column is provided."
+                ),
+                "listlike_columns": listlike_group_cols,
+            },
+            indent=2,
+        )
+
+    if listlike_group_cols:
+        column = group_by[0]
+        exploded = _explode_series_values(filtered[column], include_null=include_null)
+        counts = exploded.value_counts(dropna=not include_null, ascending=ascending)
+        groups = [
+            {"value": _to_json_safe(value), "row_count": int(count)}
+            for value, count in counts.head(top_n).items()
+        ]
+        distinct_groups = int(len(counts))
+        del exploded
+    else:
+        grouped = filtered[group_by]
+        if not include_null:
+            grouped = grouped.dropna(subset=group_by)
+
+        counts_df = (
+            grouped.groupby(group_by, dropna=not include_null)
+            .size()
+            .reset_index(name="row_count")
+        )
+        counts_df = counts_df.sort_values(
+            by=["row_count"] + group_by,
+            ascending=[ascending] + [True] * len(group_by),
+            kind="stable",
+        )
+        distinct_groups = int(len(counts_df))
+        groups = []
+        for _, row in counts_df.head(top_n).iterrows():
+            entry = {col: _to_json_safe(row[col]) for col in group_by}
+            entry["row_count"] = int(row["row_count"])
+            groups.append(entry)
+        del grouped
+        del counts_df
+
+    del df
+    del filtered
+    return json.dumps(
+        {
+            "filters": filters,
+            "group_by": group_by,
+            "matching_rows": matching_rows,
+            "distinct_groups": distinct_groups,
+            "top_group": groups[0] if groups else None,
+            "groups": groups,
+        },
+        default=str,
+        indent=2,
+    )
+
+
+@tool
+def summarize_complaints(
+    columns: list[str],
+    filters: dict | None = None,
+    include_null: bool = False,
+) -> str:
+    """Return exact descriptive statistics for complaint columns over all matching rows.
+
+    Use this for dataset-wide numeric summaries or categorical modes after
+    filtering. Unlike filter_rows, this summarizes all matching complaints
+    instead of returning example rows.
+    """
+    filters = filters or {}
+    columns = [col for col in dict.fromkeys(columns or []) if col]
+    if not columns:
+        return json.dumps({"error": "columns must contain at least one complaint column name."})
+
+    cols_to_load = list(dict.fromkeys(list(filters.keys()) + columns))
+    df = pd.read_parquet(PARQUET_PATH, columns=cols_to_load)
+    filtered = _apply_filters(df, filters)
+    matching_rows = int(len(filtered))
+
+    summaries: dict[str, dict] = {}
+    warnings: list[str] = []
+
+    for column in columns:
+        if column not in filtered.columns:
+            warnings.append(f"Column '{column}' was not found and was skipped.")
+            continue
+
+        series = filtered[column]
+        if _series_is_listlike(series):
+            exploded = _explode_series_values(series, include_null=include_null)
+            counts = exploded.value_counts(dropna=not include_null)
+            summaries[column] = {
+                "kind": "list_like",
+                "count": int(len(exploded)),
+                "distinct_values": int(len(counts)),
+                "top_values": [
+                    {"value": _to_json_safe(value), "count": int(count)}
+                    for value, count in counts.head(10).items()
+                ],
+            }
+            del exploded
+            continue
+
+        non_missing_mask = series.apply(lambda value: not _is_nan(value))
+        clean = series[non_missing_mask]
+        if clean.empty:
+            summaries[column] = {"kind": "empty", "count": 0}
+            continue
+
+        numeric = pd.to_numeric(clean, errors="coerce")
+        if numeric.notna().all():
+            summaries[column] = _build_numeric_summary(numeric)
+            continue
+
+        summaries[column] = _build_categorical_summary(clean)
+
+    del df
+    del filtered
+    payload = {
+        "filters": filters,
+        "matching_rows": matching_rows,
+        "column_summaries": summaries,
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    return json.dumps(payload, default=str, indent=2)
+
+
+@tool
+def build_complaint_stats_dataset(
+    columns: list[str],
+    filters: dict | None = None,
+    max_rows: int = 5000,
+    include_index: bool = True,
+) -> str:
+    """
+    Store an exact filtered parquet table server-side for downstream RMCP stats tools.
+
+    The tool returns a compact dataset manifest with `dataset_id`. The raw rows
+    stay on the backend so later statistical tool calls can reference them
+    without forcing the model to copy a full table back through prompt context.
+    """
+    if not columns:
+        return json.dumps(
+            {"error": "columns must contain at least one complaint column."},
+            indent=2,
+        )
+
+    try:
+        max_rows = int(max_rows)
+    except (TypeError, ValueError):
+        return json.dumps({"error": "max_rows must be an integer."}, indent=2)
+
+    max_rows = max(1, min(max_rows, 50000))
+    filters = filters or {}
+    requested_columns = [col for col in dict.fromkeys(columns) if col]
+
+    pq_df = pd.read_parquet(PARQUET_PATH)
+    filtered = _apply_filters(pq_df, filters)
+    row_count = int(len(filtered))
+
+    missing_columns = [col for col in requested_columns if col not in filtered.columns]
+    if missing_columns:
+        return json.dumps(
+            {
+                "error": "One or more requested complaint columns were not found.",
+                "missing_columns": missing_columns,
+            },
+            indent=2,
+        )
+
+    if row_count > max_rows:
+        return json.dumps(
+            {
+                "error": (
+                    "The exact filtered table is larger than max_rows. Narrow the filters "
+                    "or raise max_rows if you intentionally want a larger stats dataset."
+                ),
+                "row_count": row_count,
+                "max_rows": max_rows,
+                "filters": filters,
+                "columns": requested_columns,
+            },
+            indent=2,
+        )
+
+    data: dict[str, list] = {}
+    if include_index:
+        data["df_index"] = [int(idx) for idx in filtered.index.tolist()]
+
+    for column in requested_columns:
+        data[column] = [_to_stats_cell(value) for value in filtered[column].tolist()]
+
+    manifest = register_stats_dataset(
+        data=data,
+        source="complaints_parquet",
+        description="Exact filtered complaint dataset prepared for hosted statistical tools.",
+        metadata={
+            "filters": filters,
+            "requested_columns": requested_columns,
+            "include_index": bool(include_index),
+        },
+    )
+    return json.dumps(manifest, default=str, indent=2)
 
 
 # ---------------------------------------------------------------------------

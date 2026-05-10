@@ -529,12 +529,31 @@ AVAILABLE TOOLS
 ===============================================================================
 The following tools are available for querying NHTSA complaint data:
 
-  get_rows_by_position(indices)        — fetch full complaint rows by integer index list
-  filter_rows(field, value)            — filter the complaints parquet DB by field value
+  get_rows_by_position(count, indices, fields)
+                                      — fetch complaint rows or random examples; capped preview tool
+  filter_rows(filters, limit, fields) — fetch only the first few matching complaint rows
+  count_complaints(filters)           — exact full-dataset count of all matching complaints
+  group_complaints(group_by, filters, top_n, include_null, ascending)
+                                      — exact full-dataset counts grouped by complaint columns
+  summarize_complaints(columns, filters, include_null)
+                                      — exact descriptive statistics for complaint columns
+  build_complaint_stats_dataset(columns, filters, max_rows, include_index)
+                                      — store an exact filtered parquet table server-side
+                                         and return a dataset_id for formal stats tools
+  compare_csv_to_parquet_labels(filename, llm_label_column, parquet_label_column, ...)
+                                      — exact CSV-to-parquet label comparison using df_index join
+  build_csv_parquet_label_stats_dataset(filename, llm_label_column, parquet_label_column, ...)
+                                      — store an exact CSV-to-parquet comparison table
+                                         server-side and return a dataset_id for formal stats tools
   list_csv_files()                     — list pipeline output CSV files in the Outputs dir
   get_csv_schema(filename)             — inspect a CSV file's column structure
-  filter_csv(filename, field, value)   — filter a CSV output file by field value
-  get_csv_rows_by_position(filename, indices) — fetch CSV rows by integer index list
+  filter_csv(filename, filters, limit, fields)
+                                      — fetch only the first few matching CSV rows
+  get_csv_rows_by_position(filename, count, indices, fields)
+                                      — fetch CSV rows by integer index list or random sample
+  rmcp_status()                        — report whether the hosted RMCP stats backend is available
+  list_stats_datasets()                — list stored dataset_ids that formal stats tools can reuse
+  describe_stats_dataset(dataset_id)   — inspect one stored dataset without returning raw rows
 
 You also have access to:
 
@@ -562,13 +581,23 @@ SCHEMA REFERENCE
 ANALYTIC WORKFLOW
 ===============================================================================
 1. Read the user request carefully. Identify which rows or complaint text you need.
-2. Call the appropriate retrieval tools (in parallel where possible).
-3. If supporting fields would sharpen your judgment (e.g., injury counts, death counts,
+2. If the user wants examples or complaint text, use get_rows_by_position or filter_rows.
+3. If the user wants an exact count, distribution, most-common value, or dataset-wide
+   summary, use count_complaints, group_complaints, or summarize_complaints instead
+   of row-preview tools.
+4. If the user wants to compare LLM-generated CSV labels to human parquet labels,
+   use compare_csv_to_parquet_labels rather than inferring agreement manually from samples.
+5. If the user wants formal statistics or hypothesis tests, first call rmcp_status.
+   If RMCP is available, build a dataset with build_complaint_stats_dataset or
+   build_csv_parquet_label_stats_dataset, then use the wrapped RMCP stats tools
+   that accept dataset_id instead of raw data.
+6. Call independent tools in parallel where possible.
+7. If supporting fields would sharpen your judgment (e.g., injury counts, death counts,
    component description), fetch those columns from the same row indices.
-4. If the request is genuinely ambiguous in a way that would change your verdict,
+8. If the request is genuinely ambiguous in a way that would change your verdict,
    call voice_ask_user to clarify before proceeding.
-5. Reason over the retrieved data and form a judgment.
-6. Emit the final JSON — no further tool calls.
+9. Reason over the retrieved data and form a judgment.
+10. Emit the final JSON — no further tool calls.
 
 ===============================================================================
 FINAL OUTPUT — REQUIRED FORMAT
@@ -654,17 +683,38 @@ CHART TOOLS (each renders a chart and returns a JSON summary):
                                          filters such as MAKETXT, MODELTXT, YEARTXT,
                                          CRASH, FIRE, STATE, or COMPDESC
   compare_LLM_to_NHTSA_tool(...)      — render a chart comparing LLM labels to NHTSA labels; returns summary
+  compare_csv_to_parquet_labels(filename, llm_label_column, parquet_label_column, ...)
+                                      — exact no-chart CSV-to-parquet label comparison using df_index join
 
   describe_chart_data(chart_name)      — re-fetch the structured summary for a chart that
                                          was previously rendered (useful for follow-up questions)
 
 NHTSA QUERY TOOLS (access the complaints parquet DB and pipeline CSV outputs):
-  get_rows_by_position(indices)        — fetch full complaint rows by integer index list
-  filter_rows(field, value)            — filter the complaints parquet DB by field value
+  get_rows_by_position(count, indices, fields)
+                                      — fetch complaint rows or random examples; capped preview tool
+  filter_rows(filters, limit, fields) — fetch only the first few matching complaint rows
+  count_complaints(filters)           — exact full-dataset count of all matching complaints
+  group_complaints(group_by, filters, top_n, include_null, ascending)
+                                      — exact full-dataset counts grouped by complaint columns
+  summarize_complaints(columns, filters, include_null)
+                                      — exact descriptive statistics for complaint columns
+  build_complaint_stats_dataset(columns, filters, max_rows, include_index)
+                                      — store an exact filtered parquet table server-side
+                                         and return a dataset_id for formal stats tools
+  compare_csv_to_parquet_labels(filename, llm_label_column, parquet_label_column, ...)
+                                      — exact CSV-to-parquet label comparison using df_index join
+  build_csv_parquet_label_stats_dataset(filename, llm_label_column, parquet_label_column, ...)
+                                      — store an exact CSV-to-parquet comparison table
+                                         server-side and return a dataset_id for formal stats tools
   list_csv_files()                     — list pipeline output CSV files in the Outputs dir
   get_csv_schema(filename)             — inspect a CSV file's column structure
-  filter_csv(filename, field, value)   — filter a CSV output file by field value
-  get_csv_rows_by_position(filename, indices) — fetch CSV rows by integer index list
+  filter_csv(filename, filters, limit, fields)
+                                      — fetch only the first few matching CSV rows
+  get_csv_rows_by_position(filename, count, indices, fields)
+                                      — fetch CSV rows by integer index list or random sample
+  rmcp_status()                        — report whether the hosted RMCP stats backend is available
+  list_stats_datasets()                — list stored dataset_ids that formal stats tools can reuse
+  describe_stats_dataset(dataset_id)   — inspect one stored dataset without returning raw rows
 
 VOICE / INTERACTION:
   voice_ask_user(question)             — speak a question aloud to the user and capture
@@ -677,6 +727,9 @@ CODE EXECUTION (requires explicit user permission on EVERY call):
                                          before execution. If the user DENIES permission,
                                          do NOT retry the same code block — pick a different
                                          approach or ask the user via voice_ask_user.
+                                         Do NOT use code_exec for complaint counts,
+                                         distributions, or basic statistics when the
+                                         dedicated complaint aggregate tools can answer it.
 
 CODEBASE INSPECTION (read-only; use sparingly):
   list_project_files()                 — list files in the project directory
@@ -697,6 +750,19 @@ PARALLEL DISPATCH
 Multiple tool calls in a single response are dispatched concurrently. Batch independent
 fetches together — for example, call multiple filter queries or a chart render alongside
 a data lookup in the same turn. Do not chain independent calls one at a time.
+
+For exact whole-dataset answers, prefer the aggregate complaint tools over row-preview
+tools. filter_rows and get_rows_by_position are for examples and complaint text, not
+for exact "most common", "how many", or "across the full database" questions.
+
+For CSV-vs-parquet evaluation, prefer compare_csv_to_parquet_labels over manually
+sampling CSV rows and trying to estimate agreement from a small preview.
+
+For formal statistics or hypothesis tests, first call rmcp_status. If RMCP is
+available, build a dataset with build_complaint_stats_dataset or
+build_csv_parquet_label_stats_dataset, then call the wrapped RMCP statistical
+tools that accept dataset_id instead of raw inline data. Do not use code_exec
+for formal stats when the dedicated RMCP path is available.
 
 ===============================================================================
 CODE EXECUTION GATE
