@@ -58,16 +58,56 @@ Example: python Unit2/NHTSA_Project/LangGraph/Graph.py -a -v deepgram -vp aura-2
 WELCOME_TTS_TEXT = "Welcome back! What NHTSA adventure shall we embark on?"
 
 
+PIPELINE_STATE_KEYS = {
+    "user_request",
+    "task_type",
+    "query_result",
+    "reasoning_output",
+    "analysis",
+    "analysis_prompt_name",
+    "response",
+    "csv_write_confirmed",
+    "agentic_subtype",
+    "iteration_log",
+}
+
+
+def _extract_final_tts_payload(data: dict | str) -> dict | str:
+    """
+    Reduce a LangGraph final-state envelope to the user-facing payload for TTS.
+
+    LangGraph's compiled app.invoke(...) returns the full updated state dict.
+    Only state["response"] should reach Mercury for the final spoken summary;
+    the rest of the state is internal pipeline bookkeeping.
+    """
+    parsed: dict | str = data
+    if isinstance(parsed, str):
+        try:
+            parsed = json.loads(parsed)
+        except json.JSONDecodeError:
+            return data
+
+    if isinstance(parsed, dict) and "response" in parsed:
+        state_keys_present = PIPELINE_STATE_KEYS.intersection(parsed.keys())
+        if len(parsed) == 1 or len(state_keys_present) > 1:
+            return parsed["response"]
+
+    return parsed
+
 
 def json_to_spoken_text(data: dict | str) -> str:
     """
-    Converts the pipeline's output (a State dict or JSON string) into natural
-    spoken prose suitable for TTS. Mercury handles this well since it's a fast
-    diffusion LLM — good fit for a lightweight formatting step at the end of
-    the pipeline.
+    Convert the final pipeline payload into natural spoken prose for TTS.
+
+    The caller may pass the full LangGraph final state, the already-extracted
+    response field, or a JSON string produced by an upstream node. In all
+    cases, normalize to the user-facing response payload first.
     """
-    # If the data is already a plain string (e.g. response field was already prose),
-    # try to parse it as JSON first; if that fails, return it as-is.
+    data = _extract_final_tts_payload(data)
+
+    # If the payload is already plain prose, return it directly. If it is a
+    # JSON string (for example the agentic analyze node's structured verdict),
+    # parse it so Mercury can verbalize the structured content cleanly.
     if isinstance(data, str):
         try:
             data = json.loads(data)
@@ -375,7 +415,10 @@ def main() -> None:
         "iteration_log": [],         # list[dict] — appended by agentic nodes each iteration
     })
 
-    spoken_response = json_to_spoken_text(result["response"])
+    # LangGraph returns the full final state here. The final Mercury+TTS
+    # handoff should speak only state["response"], not the rest of the
+    # bookkeeping fields, so json_to_spoken_text normalizes that envelope first.
+    spoken_response = json_to_spoken_text(result)
     if audio_available:
         # Same dispatch contract as the greeting call above — neither `model=`
         # nor `voice=` is passed. generate_TTS_audio reads both from the
