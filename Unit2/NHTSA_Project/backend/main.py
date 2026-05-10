@@ -39,6 +39,9 @@ the *frontend's* domain.
 from __future__ import annotations
 
 import asyncio
+import time
+from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -84,6 +87,63 @@ from audio_io import (
 # ---------------------------------------------------------------------------
 _PIPELINE_SLOTS = asyncio.Semaphore(1)
 _AUDIO_SLOTS = asyncio.Semaphore(1)
+_AGENTIC_SESSION_TTL_SECONDS = 30 * 60
+_AGENTIC_SESSIONS: dict[str, dict[str, Any]] = {}
+
+
+def _prune_expired_agentic_sessions() -> None:
+    """
+    Drop stale in-memory agentic sessions so hosted follow-up memory is bounded.
+
+    The frontend can explicitly start a new conversation at any time, but users
+    can also abandon tabs. A short TTL keeps those abandoned transcripts from
+    living forever on the backend while still leaving enough time for normal
+    conversational follow-ups.
+    """
+    now = time.time()
+    expired_session_ids = [
+        session_id
+        for session_id, record in _AGENTIC_SESSIONS.items()
+        if now - float(record["updated_at"]) > _AGENTIC_SESSION_TTL_SECONDS
+    ]
+    for session_id in expired_session_ids:
+        _AGENTIC_SESSIONS.pop(session_id, None)
+
+
+def _load_agentic_session(session_id: str) -> dict[str, Any] | None:
+    _prune_expired_agentic_sessions()
+    record = _AGENTIC_SESSIONS.get(session_id)
+    if record is None:
+        return None
+    return dict(record["state"])
+
+
+def _store_agentic_session(session_id: str, state: dict[str, Any]) -> None:
+    _AGENTIC_SESSIONS[session_id] = {
+        "state": dict(state),
+        "updated_at": time.time(),
+    }
+
+
+def _clear_agentic_session(session_id: str) -> None:
+    _AGENTIC_SESSIONS.pop(session_id, None)
+
+
+def _state_is_resumable_agentic(state: dict[str, Any]) -> bool:
+    """
+    Persist only sessions that can actually continue a later follow-up turn.
+
+    The hosted continuation contract applies only to the agentic branch, and it
+    requires a serialized internal message transcript. Non-agentic runs or
+    agentic runs that never produced conversation_messages should not occupy the
+    session store.
+    """
+    return (
+        state.get("task_type") == "agentic_retrieve_and_analyze"
+        and state.get("agentic_subtype") in {"agentic_analyze", "agentic_explore"}
+        and isinstance(state.get("conversation_messages"), list)
+        and len(state.get("conversation_messages") or []) > 0
+    )
 
 
 
@@ -150,6 +210,24 @@ class RunRequest(BaseModel):
             "The natural-language request the LangGraph pipeline should "
             "process. Same content the local CLI captures from stdin or "
             "transcribes from microphone input."
+        ),
+    )
+    session_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description=(
+            "Opaque browser-generated conversation identifier. Follow-up turns "
+            "reuse the same id so the backend can restore the prior agentic "
+            "message/tool transcript."
+        ),
+    )
+    continue_session: bool = Field(
+        default=False,
+        description=(
+            "True when this request is a follow-up inside an already-running "
+            "agentic conversation and should reuse the stored session state "
+            "instead of starting from a blank pipeline state."
         ),
     )
 
@@ -449,6 +527,27 @@ async def run(req: RunRequest) -> StreamingResponse:
        edge) to NOT buffer. Without it, events can sit in a buffer until
        the response closes — defeating the point of a stream.
     """
+    session_id = (req.session_id or "").strip() or str(uuid4())
+    if not req.continue_session:
+        # A non-follow-up request is a deliberate reset boundary for this
+        # browser conversation id. Clearing now prevents an accidental reuse of
+        # stale agentic history if the frontend chooses to recycle the same id.
+        _clear_agentic_session(session_id)
+
+    prior_state = None
+    if req.continue_session:
+        prior_state = _load_agentic_session(session_id)
+        if prior_state is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "The requested agentic session expired or was never created. "
+                    "Start a new conversation before sending a follow-up."
+                ),
+            )
+
+    final_state_box: dict[str, Any] = {}
+
     async def event_source():
         # Try to acquire the single pipeline slot WITHOUT blocking. If another
         # request already holds it, emit one structured "busy" SSE frame so the
@@ -472,9 +571,28 @@ async def run(req: RunRequest) -> StreamingResponse:
             return
 
         try:
-            async for event in stream_pipeline(req.user_request):
+            async for event in stream_pipeline(
+                req.user_request,
+                prior_state=prior_state,
+                final_state_sink=final_state_box,
+            ):
+                if event.get("event") in {"started", "completed"}:
+                    event = {
+                        **event,
+                        "data": {
+                            **dict(event.get("data") or {}),
+                            "session_id": session_id,
+                        },
+                    }
                 yield encode_sse(event)
         finally:
+            final_state = final_state_box.get("state")
+            succeeded = final_state_box.get("succeeded") is True
+            if succeeded and isinstance(final_state, dict):
+                if _state_is_resumable_agentic(final_state):
+                    _store_agentic_session(session_id, final_state)
+                else:
+                    _clear_agentic_session(session_id)
             # Always release — covers normal completion, exceptions inside the
             # graph, AND client disconnects (Starlette closes the generator).
             _PIPELINE_SLOTS.release()

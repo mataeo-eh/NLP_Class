@@ -112,8 +112,34 @@ def _initial_state(user_request: str) -> dict[str, Any]:
         "response": "",
         "csv_write_confirmed": False,
         "agentic_subtype": "",
+        "conversation_messages": [],
+        "resume_agentic_session": False,
         "iteration_log": [],
     }
+
+
+def _seed_state_for_request(
+    user_request: str,
+    prior_state: dict[str, Any] | None,
+) -> tuple[dict[str, Any], bool]:
+    """
+    Build the exact LangGraph input state for one hosted /run call.
+
+    Fresh requests always start from the canonical blank state. Resumed agentic
+    follow-ups reuse the prior state snapshot, replace only the current
+    user_request, and flip resume_agentic_session=True so the classifier nodes
+    and agentic node can restore the prior conversation transcript.
+    """
+    if prior_state is None:
+        return _initial_state(user_request), False
+
+    seeded_state = dict(prior_state)
+    seeded_state["user_request"] = user_request
+    seeded_state["response"] = ""
+    seeded_state["reasoning_output"] = ""
+    seeded_state["csv_write_confirmed"] = False
+    seeded_state["resume_agentic_session"] = True
+    return seeded_state, True
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +196,11 @@ def _summarise_delta(delta: dict[str, Any]) -> dict[str, Any]:
             # into TTS. Suppressing it here keeps END-bound hosted runs from
             # showing redundant intermediate reasoning.
             continue
+        if key in ("conversation_messages", "resume_agentic_session"):
+            # These fields are purely backend session bookkeeping. Shipping the
+            # full restored transcript over SSE would bloat every node_update,
+            # and the resume flag has no user-facing value in the raw event log.
+            continue
         if key in ("query_result", "analysis", "iteration_log") and isinstance(value, list):
             # Send a count plus the first element as a sample — enough for the
             # frontend to display "retrieved 12 rows" without shipping the
@@ -205,7 +236,12 @@ def _drain_narration_events(queue: deque[str]) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # Public API.
 # ---------------------------------------------------------------------------
-async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
+async def stream_pipeline(
+    user_request: str,
+    *,
+    prior_state: dict[str, Any] | None = None,
+    final_state_sink: dict[str, Any] | None = None,
+) -> AsyncIterator[dict[str, Any]]:
     """
     Run the LangGraph pipeline on the given user_request and yield SSE-shaped
     progress events.
@@ -220,9 +256,16 @@ async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
     The frontend can use the `event` field as the SSE event name (browsers
     subscribe to specific event names via `EventSource.addEventListener`).
     """
-    yield {"event": "started", "data": {"user_request": user_request}}
+    working_state, resumed = _seed_state_for_request(user_request, prior_state)
+    yield {
+        "event": "started",
+        "data": {
+            "user_request": user_request,
+            "continued": resumed,
+        },
+    }
 
-    final_state: dict[str, Any] = {}
+    final_state: dict[str, Any] = dict(working_state)
     narration_queue: deque[str] = deque()
 
     def enqueue_narration(text: str) -> None:
@@ -234,7 +277,7 @@ async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
         # node completion. Each chunk is a {node_name: state_delta} dict. We
         # forward each node->delta pair as its own SSE event so the frontend
         # can render incremental progress.
-        async for chunk in graph_app.astream(_initial_state(user_request)):
+        async for chunk in graph_app.astream(working_state):
             if not isinstance(chunk, dict):
                 # Defensive: if a future LangGraph version changes the chunk
                 # shape, fall back to a generic event rather than crashing.
@@ -271,11 +314,15 @@ async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
                 # the final answer text.
                 "response": _to_jsonable(final_state.get("response", "")),
                 "task_type": final_state.get("task_type", ""),
+                "continued": resumed,
                 "analysis_prompt_name": final_state.get("analysis_prompt_name", ""),
                 "row_count": len(final_state.get("query_result") or []),
                 "analysis_count": len(final_state.get("analysis") or []),
             },
         }
+        if final_state_sink is not None:
+            final_state_sink["state"] = dict(final_state)
+            final_state_sink["succeeded"] = True
     except Exception as exc:
         # Surface errors to the frontend rather than letting the SSE stream die
         # silently. Keep the traceback server-side only — never ship internal
@@ -291,6 +338,9 @@ async def stream_pipeline(user_request: str) -> AsyncIterator[dict[str, Any]]:
                 "type": type(exc).__name__,
             },
         }
+        if final_state_sink is not None:
+            final_state_sink["state"] = dict(final_state)
+            final_state_sink["succeeded"] = False
     finally:
         set_headless_narration_sink(None)
 
