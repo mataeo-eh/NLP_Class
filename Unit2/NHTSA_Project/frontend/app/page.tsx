@@ -296,6 +296,27 @@ export default function HomePage() {
     return audioContext;
   }
 
+  async function unlockAudioPlaybackFromUserGesture(): Promise<void> {
+    // MDN's Web Audio autoplay guidance is explicit here: create or resume the
+    // AudioContext from inside a user gesture. If we wait until after an async
+    // fetch resolves, many browsers keep the context suspended and all later
+    // streamed TTS scheduling is silent even though the backend keeps sending
+    // valid PCM bytes.
+    const audioContext = await ensureAudioContextReady();
+    if (!audioContext) {
+      appendLog(
+        "[audio] browser has no AudioContext support; streamed autoplay is unavailable",
+      );
+      return;
+    }
+
+    if (audioContext.state !== "running") {
+      appendLog(
+        `[audio] context remained ${audioContext.state} after the user gesture; browser autoplay may still block playback`,
+      );
+    }
+  }
+
   function schedulePcmChunk(
     audioContext: AudioContext,
     pcmBytes: Uint8Array,
@@ -720,6 +741,8 @@ export default function HomePage() {
       return;
     }
 
+    await unlockAudioPlaybackFromUserGesture();
+
     abortRef.current?.abort();
     interruptSpeechPlayback();
     stopMicrophoneStream();
@@ -808,7 +831,7 @@ export default function HomePage() {
 
     abortRef.current?.abort();
     interruptSpeechPlayback();
-    void ensureAudioContextReady();
+    await unlockAudioPlaybackFromUserGesture();
     stopMicrophoneStream();
     appendChatTurn({ role: "user", text: trimmedRequest });
     setRequest("");
