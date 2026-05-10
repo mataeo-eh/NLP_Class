@@ -153,12 +153,50 @@ export default function HomePage() {
     }
   }
 
-  function formatLogPayload(payload: unknown): string {
-    try {
-      return JSON.stringify(payload, null, 2);
-    } catch {
-      return String(payload);
+  function formatLogValue(value: unknown, indent = 0): string[] {
+    const prefix = "  ".repeat(indent);
+
+    if (value === null) {
+      return [`${prefix}null`];
     }
+    if (typeof value === "boolean" || typeof value === "number") {
+      return [`${prefix}${String(value)}`];
+    }
+    if (typeof value === "string") {
+      const normalized = value.trim().replace(/\r\n/g, "\n");
+      if (!normalized) {
+        return [`${prefix}""`];
+      }
+      return normalized
+        .split("\n")
+        .map((line) => `${prefix}${line}`);
+    }
+    if (Array.isArray(value)) {
+      if (value.length === 0) {
+        return [`${prefix}[]`];
+      }
+      return value.flatMap((item) => {
+        const itemLines = formatLogValue(item, indent + 1);
+        if (itemLines.length === 1) {
+          return [`${prefix}- ${itemLines[0].trimStart()}`];
+        }
+        return [`${prefix}- ${itemLines[0].trimStart()}`, ...itemLines.slice(1)];
+      });
+    }
+    if (typeof value === "object") {
+      const entries = Object.entries(value);
+      if (entries.length === 0) {
+        return [`${prefix}{}`];
+      }
+      return entries.flatMap(([key, entryValue]) => {
+        const valueLines = formatLogValue(entryValue, indent + 1);
+        if (valueLines.length === 1) {
+          return [`${prefix}${key}: ${valueLines[0].trimStart()}`];
+        }
+        return [`${prefix}${key}:`, ...valueLines];
+      });
+    }
+    return [`${prefix}${String(value)}`];
   }
 
   function formatSseEventForLog(event: SseEvent): string {
@@ -166,10 +204,10 @@ export default function HomePage() {
     if (parsedPayload === null) {
       return `[${event.event}] ${event.data.trim()}`;
     }
-    // React preserves the embedded newlines inside <pre>, so pretty-printing
-    // the parsed JSON here makes the browser terminal far easier to scan than
-    // the original one-line payload dump.
-    return `[${event.event}]\n${formatLogPayload(parsedPayload)}`;
+    // Render structured event data into a terminal-style outline rather than
+    // JSON.stringify output so embedded newlines display as real whitespace
+    // instead of literal `\n` escape sequences.
+    return [`[${event.event}]`, ...formatLogValue(parsedPayload, 1)].join("\n");
   }
 
   function replaceAudioUrl(nextUrl: string) {
@@ -310,7 +348,6 @@ export default function HomePage() {
     if (!backendBaseUrl || !spokenText) return;
 
     setSpeaking(true);
-    appendLog(`POST ${backendBaseUrl}/audio/speech`);
     try {
       const response = await fetch(`${backendBaseUrl}/audio/speech`, {
         method: "POST",
@@ -330,7 +367,6 @@ export default function HomePage() {
       const audio = audioElementRef.current ?? new Audio(nextUrl);
       try {
         await audio.play();
-        appendLog("[audio] playback started");
       } catch {
         appendLog("[audio] browser blocked autoplay; use the audio controls below");
       }
@@ -375,7 +411,6 @@ export default function HomePage() {
     const controller = new AbortController();
     speechAbortRef.current = controller;
     setSpeaking(true);
-    appendLog(`POST ${backendBaseUrl}/audio/speech/stream`);
 
     try {
       const response = await fetch(`${backendBaseUrl}/audio/speech/stream`, {
@@ -412,7 +447,6 @@ export default function HomePage() {
       const reader = response.body.getReader();
       const pcmChunks: Uint8Array[] = [];
       let carry = new Uint8Array(0);
-      let loggedPlaybackStart = false;
 
       while (true) {
         const { value, done } = await reader.read();
@@ -438,10 +472,6 @@ export default function HomePage() {
 
         pcmChunks.push(combined);
         schedulePcmChunk(audioContext, combined, sampleRate);
-        if (!loggedPlaybackStart) {
-          appendLog("[audio] streaming playback scheduled");
-          loggedPlaybackStart = true;
-        }
       }
 
       if (carry.byteLength > 0) {
@@ -459,7 +489,6 @@ export default function HomePage() {
         buildWaveBlobFromPcmChunks(pcmChunks, sampleRate),
       );
       replaceAudioUrl(nextUrl);
-      appendLog("[audio] replay controls are ready");
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
         appendLog("[audio] stream cancelled");
