@@ -20,6 +20,7 @@ import os
 import sys
 import wave
 from collections.abc import Iterator
+from email.message import Message
 from io import BytesIO
 from pathlib import Path
 
@@ -115,6 +116,26 @@ def _safe_filename(filename: str | None) -> str:
     return "audio.webm"
 
 
+def _normalized_content_type(content_type: str | None) -> str | None:
+    """
+    Return the base media type from the browser-supplied Content-Type header.
+
+    Browser recorders are allowed to append RFC-style parameters such as
+    `codecs=mp4a.40.2`. FastAPI surfaces that full header string through
+    UploadFile.content_type, so we parse it with the standard library's MIME
+    header handling instead of comparing the raw string directly.
+    """
+    if not content_type:
+        return None
+
+    message = Message()
+    message["Content-Type"] = content_type
+    normalized = message.get_content_type()
+    if normalized == "text/plain":
+        return content_type.strip().lower()
+    return normalized
+
+
 def validate_audio_upload(content_type: str | None, payload: bytes) -> None:
     """
     Validate the uploaded audio envelope before forwarding it to OpenAI.
@@ -123,7 +144,8 @@ def validate_audio_upload(content_type: str | None, payload: bytes) -> None:
     and bytes. We use those concrete fields directly:
 
     * payload length enforces empty-upload and max-size rules.
-    * content_type must be one of the accepted browser audio/video media types.
+    * content_type is normalized to its base media type before validation, so
+      browser codec parameters like `audio/mp4; codecs=mp4a.40.2` remain valid.
     * filename is handled separately as a provider hint and is never trusted for
       security decisions.
     """
@@ -133,7 +155,8 @@ def validate_audio_upload(content_type: str | None, payload: bytes) -> None:
         raise ValueError(
             f"Uploaded audio is {len(payload)} bytes; limit is {MAX_AUDIO_UPLOAD_BYTES} bytes."
         )
-    if content_type and content_type.lower() not in ALLOWED_AUDIO_CONTENT_TYPES:
+    normalized_content_type = _normalized_content_type(content_type)
+    if normalized_content_type and normalized_content_type not in ALLOWED_AUDIO_CONTENT_TYPES:
         raise ValueError(f"Unsupported audio content type: {content_type}")
 
 
