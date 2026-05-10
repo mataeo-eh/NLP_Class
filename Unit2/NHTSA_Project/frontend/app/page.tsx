@@ -140,7 +140,36 @@ export default function HomePage() {
   const drainingSpeechQueueRef = useRef(false);
 
   function appendLog(line: string) {
-    setLog((prev) => (prev ? prev + "\n" + line : line));
+    const cleanedLine = line.trim();
+    if (!cleanedLine) return;
+    setLog((prev) => (prev ? `${prev}\n\n${cleanedLine}` : cleanedLine));
+  }
+
+  function tryParseJson(rawText: string): unknown | null {
+    try {
+      return JSON.parse(rawText);
+    } catch {
+      return null;
+    }
+  }
+
+  function formatLogPayload(payload: unknown): string {
+    try {
+      return JSON.stringify(payload, null, 2);
+    } catch {
+      return String(payload);
+    }
+  }
+
+  function formatSseEventForLog(event: SseEvent): string {
+    const parsedPayload = tryParseJson(event.data);
+    if (parsedPayload === null) {
+      return `[${event.event}] ${event.data.trim()}`;
+    }
+    // React preserves the embedded newlines inside <pre>, so pretty-printing
+    // the parsed JSON here makes the browser terminal far easier to scan than
+    // the original one-line payload dump.
+    return `[${event.event}]\n${formatLogPayload(parsedPayload)}`;
   }
 
   function replaceAudioUrl(nextUrl: string) {
@@ -722,7 +751,7 @@ export default function HomePage() {
         buffer = rest;
 
         for (const ev of events) {
-          appendLog(`[${ev.event}] ${ev.data}`);
+          appendLog(formatSseEventForLog(ev));
 
           if (ev.event === "busy") {
             setAssistantStatus(

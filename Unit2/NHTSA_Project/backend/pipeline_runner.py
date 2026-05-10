@@ -162,6 +162,14 @@ def _summarise_delta(delta: dict[str, Any]) -> dict[str, Any]:
             # updates prevents terminal nodes (retrieve_data, agentic_* paths)
             # from sending the same final answer twice back-to-back.
             continue
+        if key == "reasoning_output":
+            # The hosted frontend already receives explicit Mercury narration
+            # events plus the final `completed` response. Sending raw
+            # reasoning_output into the terminal stream adds a second,
+            # terminal-only explanation that the browser never needs to route
+            # into TTS. Suppressing it here keeps END-bound hosted runs from
+            # showing redundant intermediate reasoning.
+            continue
         if key in ("query_result", "analysis", "iteration_log") and isinstance(value, list):
             # Send a count plus the first element as a sample — enough for the
             # frontend to display "retrieved 12 rows" without shipping the
