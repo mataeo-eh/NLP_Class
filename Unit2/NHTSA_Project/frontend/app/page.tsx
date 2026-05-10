@@ -17,6 +17,11 @@ type SseEvent = {
   data: string;
 };
 
+type ChatTurn = {
+  role: "user" | "assistant";
+  text: string;
+};
+
 type WarmupResponse = {
   welcome_text?: unknown;
   ready_prompt?: unknown;
@@ -26,6 +31,13 @@ type WindowWithWebkitAudioContext = Window &
   typeof globalThis & {
     webkitAudioContext?: typeof AudioContext;
   };
+
+function createConversationId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
 
 function pcmChunkToAudioBuffer(
   audioContext: AudioContext,
@@ -113,6 +125,9 @@ function guessAudioFilename(mimeType: string): string {
 
 export default function HomePage() {
   const [request, setRequest] = useState("");
+  const [conversationId, setConversationId] = useState(() => createConversationId());
+  const [canContinueSession, setCanContinueSession] = useState(false);
+  const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
   const [warmingUp, setWarmingUp] = useState(false);
   const [warmedUp, setWarmedUp] = useState(false);
   const [running, setRunning] = useState(false);
@@ -143,6 +158,12 @@ export default function HomePage() {
     const cleanedLine = line.trim();
     if (!cleanedLine) return;
     setLog((prev) => (prev ? `${prev}\n\n${cleanedLine}` : cleanedLine));
+  }
+
+  function appendChatTurn(turn: ChatTurn) {
+    const cleanedText = turn.text.trim();
+    if (!cleanedText) return;
+    setChatTurns((prev) => [...prev, { role: turn.role, text: cleanedText }]);
   }
 
   function tryParseJson(rawText: string): unknown | null {
@@ -338,6 +359,24 @@ export default function HomePage() {
     try {
       const payload = JSON.parse(eventData) as { message?: unknown };
       return typeof payload.message === "string" ? payload.message.trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function extractSessionId(eventData: string): string {
+    try {
+      const payload = JSON.parse(eventData) as { session_id?: unknown };
+      return typeof payload.session_id === "string" ? payload.session_id.trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
+  function extractTaskType(eventData: string): string {
+    try {
+      const payload = JSON.parse(eventData) as { task_type?: unknown };
+      return typeof payload.task_type === "string" ? payload.task_type.trim() : "";
     } catch {
       return "";
     }
@@ -730,8 +769,27 @@ export default function HomePage() {
     await runPipelineRequest(request);
   }
 
+  function startNewConversation() {
+    abortRef.current?.abort();
+    interruptSpeechPlayback();
+    stopMicrophoneStream();
+    setConversationId(createConversationId());
+    setCanContinueSession(false);
+    setChatTurns([]);
+    setLog("");
+    setFinalResponse("");
+    replaceAudioUrl("");
+    setRequest("");
+    setAssistantStatus(
+      warmedUp
+        ? "Started a new conversation. Send a fresh request when ready."
+        : "Press Run pipeline to hear the greeting and unlock the hosted audio flow.",
+    );
+  }
+
   async function runPipelineRequest(userRequest: string) {
     const trimmedRequest = userRequest.trim();
+    const continuingThisTurn = canContinueSession;
 
     if (!backendBaseUrl) {
       appendLog(
@@ -752,25 +810,44 @@ export default function HomePage() {
     interruptSpeechPlayback();
     void ensureAudioContextReady();
     stopMicrophoneStream();
+    appendChatTurn({ role: "user", text: trimmedRequest });
+    setRequest("");
     const controller = new AbortController();
     abortRef.current = controller;
 
     setRunning(true);
-    setLog("");
     setFinalResponse("");
     replaceAudioUrl("");
-    setAssistantStatus("Pipeline running...");
-    appendLog(`POST ${backendBaseUrl}/run`);
+    setAssistantStatus(
+      continuingThisTurn
+        ? "Continuing the active agentic conversation..."
+        : "Pipeline running...",
+    );
+    if (!continuingThisTurn) {
+      setLog("");
+    } else {
+      appendLog("----- follow-up -----");
+    }
+    appendLog(
+      `POST ${backendBaseUrl}/run (${continuingThisTurn ? "continue" : "new"} conversation ${conversationId})`,
+    );
 
     try {
       const response = await fetch(`${backendBaseUrl}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_request: trimmedRequest }),
+        body: JSON.stringify({
+          user_request: trimmedRequest,
+          session_id: conversationId,
+          continue_session: continuingThisTurn,
+        }),
         signal: controller.signal,
       });
 
       if (!response.ok || !response.body) {
+        if (response.status === 409) {
+          setCanContinueSession(false);
+        }
         appendLog(`HTTP ${response.status} — ${await response.text()}`);
         setAssistantStatus("Pipeline request failed.");
         return;
@@ -791,6 +868,7 @@ export default function HomePage() {
           appendLog(formatSseEventForLog(ev));
 
           if (ev.event === "busy") {
+            setCanContinueSession(continuingThisTurn);
             setAssistantStatus(
               extractMessage(ev.data) || "The backend is busy. Try again shortly.",
             );
@@ -798,9 +876,18 @@ export default function HomePage() {
           }
 
           if (ev.event === "error") {
+            setCanContinueSession(continuingThisTurn);
             setAssistantStatus(
               extractMessage(ev.data) || "The pipeline returned an error.",
             );
+            continue;
+          }
+
+          if (ev.event === "started") {
+            const startedSessionId = extractSessionId(ev.data);
+            if (startedSessionId) {
+              setConversationId(startedSessionId);
+            }
             continue;
           }
 
@@ -814,10 +901,19 @@ export default function HomePage() {
 
           if (ev.event === "completed") {
             const responseText = extractFinalResponse(ev.data);
+            const taskType = extractTaskType(ev.data);
+            const resumableAgenticConversation =
+              taskType === "agentic_retrieve_and_analyze";
+            setCanContinueSession(resumableAgenticConversation);
             setFinalResponse(responseText);
             if (responseText) {
+              appendChatTurn({ role: "assistant", text: responseText });
               queueSpeechText(responseText);
-              setAssistantStatus("Final response ready.");
+              setAssistantStatus(
+                resumableAgenticConversation
+                  ? "Response ready. You can ask a follow-up in the same agentic conversation."
+                  : "Final response ready.",
+              );
             } else {
               setAssistantStatus("Pipeline completed without a final response string.");
               appendLog("[audio] completed event did not include a response string");
@@ -826,9 +922,13 @@ export default function HomePage() {
         }
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      appendLog(`stream ended: ${message}`);
-      setAssistantStatus("The pipeline stream ended early.");
+      if (err instanceof DOMException && err.name === "AbortError") {
+        appendLog("stream cancelled");
+      } else {
+        const message = err instanceof Error ? err.message : String(err);
+        appendLog(`stream ended: ${message}`);
+        setAssistantStatus("The pipeline stream ended early.");
+      }
     } finally {
       setRunning(false);
     }
@@ -874,6 +974,35 @@ export default function HomePage() {
           {assistantStatus}
         </div>
 
+        <p className="session-copy">
+          Conversation ID: <code>{conversationId}</code>
+          {canContinueSession ? " (follow-ups will reuse the current agentic session)" : ""}
+        </p>
+
+        <div className="conversation-panel">
+          <p className="conversation-title">Conversation transcript</p>
+          {chatTurns.length === 0 ? (
+            <p className="conversation-empty">
+              Your requests and the assistant&apos;s final responses will appear here.
+            </p>
+          ) : (
+            <div className="conversation-list">
+              {chatTurns.map((turn, index) => (
+                <article
+                  key={`${turn.role}-${index}`}
+                  className="conversation-turn"
+                  data-role={turn.role}
+                >
+                  <p className="conversation-role">
+                    {turn.role === "user" ? "You" : "Assistant"}
+                  </p>
+                  <p className="conversation-text">{turn.text}</p>
+                </article>
+              ))}
+            </div>
+          )}
+        </div>
+
         <textarea
           value={request}
           onChange={(e) => setRequest(e.target.value)}
@@ -905,6 +1034,13 @@ export default function HomePage() {
             }
           >
             {running ? "Sending..." : "Send message"}
+          </button>
+          <button
+            type="button"
+            onClick={startNewConversation}
+            disabled={warmingUp || running || recording || transcribing}
+          >
+            New conversation
           </button>
           <button
             type="button"
