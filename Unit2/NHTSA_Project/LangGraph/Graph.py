@@ -68,6 +68,8 @@ PIPELINE_STATE_KEYS = {
     "response",
     "csv_write_confirmed",
     "agentic_subtype",
+    "conversation_messages",
+    "resume_agentic_session",
     "iteration_log",
 }
 

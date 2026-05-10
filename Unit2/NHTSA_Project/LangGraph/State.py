@@ -48,6 +48,31 @@ class State(TypedDict):
     #               agentic sub-graph node.
     agentic_subtype: str
 
+    # Serialized LangChain message history for the active agentic conversation.
+    # This is ONLY populated by the agentic nodes. It preserves the exact
+    # system / user / assistant / tool exchange that occurred inside the
+    # node-local llm.invoke(...) loop so a later follow-up can rebuild the same
+    # conversational context instead of starting from a blank prompt.
+    #
+    # Storage format:
+    #   list[dict] produced by langchain_core.messages.messages_to_dict(...)
+    #
+    # Populated by: agentic_analyze and agentic_explore (Nodes.py)
+    # Consumed by:  those same nodes on a later follow-up run when
+    #               resume_agentic_session == True.
+    conversation_messages: list[dict]
+
+    # Explicit backend-controlled flag that says "this /run call is a follow-up
+    # inside the same active agentic session; do NOT re-classify from scratch."
+    # The backend sets it True only when the frontend sends continue_session and
+    # a resumable agentic state snapshot already exists for that session id.
+    #
+    # Populated by: backend/pipeline_runner.py when seeding a resumed run
+    # Consumed by:  classify_task, classify_agentic_subtype, and the agentic
+    #               nodes to short-circuit classification and restore prior
+    #               conversational history.
+    resume_agentic_session: bool
+
     # User confirmation gate between the analyze node and csv_append. The
     # confirm_csv_write node sets this flag to True when the user explicitly
     # approves writing analysis results to disk, and False otherwise (including

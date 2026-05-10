@@ -3,6 +3,7 @@ import os
 import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any
 
 # Prompts.py and LLM_Tools/ both live one level up in NHTSA_Project/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -10,7 +11,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "LLM_Tools"))
 
 from State import State
 from dotenv import load_dotenv
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import (
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+    messages_from_dict,
+    messages_to_dict,
+)
 from Prompts import (
     Specify_Task_Type,
     Specify_Agentic_Subtype,   # sub-classifier prompt; added by W5
@@ -72,9 +79,92 @@ from Project_Tools.Runtime_Options import is_headless_mode
 load_dotenv()
 
 
+def _restore_agentic_messages(
+    state: State,
+    *,
+    system_prompt: str,
+    initial_user_prompt: str,
+    follow_up_user_request: str,
+) -> tuple[list[Any], bool]:
+    """
+    Rebuild the exact LangChain message stack for an agentic follow-up.
+
+    Why this helper exists:
+      The agentic nodes keep their conversational memory inside a local
+      llm.invoke(...) loop rather than in LangGraph-managed MessagesState.
+      That means a later /run follow-up must explicitly restore the prior
+      system / assistant / tool transcript if we want the model to remember
+      what it already retrieved or said.
+
+    Return shape:
+      (messages, resumed)
+        messages - ready-to-invoke LangChain message objects
+        resumed  - True when prior history was restored successfully
+    """
+    stored_messages = state.get("conversation_messages") or []
+    wants_resume = bool(state.get("resume_agentic_session"))
+
+    if not wants_resume or not stored_messages:
+        return (
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=initial_user_prompt),
+            ],
+            False,
+        )
+
+    try:
+        restored_messages = list(messages_from_dict(stored_messages))
+    except Exception:
+        restored_messages = []
+
+    if not restored_messages:
+        return (
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=initial_user_prompt),
+            ],
+            False,
+        )
+
+    # Keep the stored tool/assistant transcript but refresh the leading system
+    # prompt to match the current code version in case the prompt text changed
+    # between runs or deployments.
+    if isinstance(restored_messages[0], SystemMessage):
+        restored_messages[0] = SystemMessage(content=system_prompt)
+    else:
+        restored_messages.insert(0, SystemMessage(content=system_prompt))
+
+    # The new browser message is the latest human turn in the ongoing dialogue.
+    restored_messages.append(HumanMessage(content=follow_up_user_request))
+    return restored_messages, True
+
+
+def _serialise_agentic_messages(messages: list[Any]) -> list[dict]:
+    """
+    Convert LangChain message objects into plain dicts for backend session
+    storage. The serialized form is deterministic and round-trips through
+    messages_from_dict(...) on the next follow-up run.
+    """
+    return messages_to_dict(list(messages))
+
+
 
 def classify_task(state: State) -> dict:
     user_request = state["user_request"]
+
+    # Follow-up turns inside an active agentic browser session should keep the
+    # previously chosen task type instead of re-running the top-level
+    # classifier. Re-classifying here would route the follow-up through START
+    # again and destroy the intended chatbot-style continuity.
+    if (
+        state.get("resume_agentic_session")
+        and state.get("task_type") == "agentic_retrieve_and_analyze"
+        and state.get("conversation_messages")
+    ):
+        task_type = str(state["task_type"])
+        narrate_node_result("classify_task", {"task_type": task_type, "resumed": True})
+        return {"task_type": task_type}
 
     # Build system + user prompts from Prompts.py
     prompts = Specify_Task_Type(user_request)
@@ -128,6 +218,23 @@ def classify_agentic_subtype(state: State) -> dict:
         LangGraph merges this dict into the running State automatically.
     """
     user_request = state["user_request"]
+
+    # Resumed agentic follow-ups should preserve the previously selected
+    # subtype. The node-local message history already contains the prior
+    # assistant/tool context, so re-running the subtype classifier would be both
+    # redundant and a source of accidental branch switches mid-conversation.
+    if (
+        state.get("resume_agentic_session")
+        and state.get("task_type") == "agentic_retrieve_and_analyze"
+        and state.get("agentic_subtype") in {"agentic_analyze", "agentic_explore"}
+        and state.get("conversation_messages")
+    ):
+        agentic_subtype = str(state["agentic_subtype"])
+        narrate_node_result(
+            "classify_agentic_subtype",
+            {"agentic_subtype": agentic_subtype, "resumed": True},
+        )
+        return {"agentic_subtype": agentic_subtype}
 
     # Build system + user prompts from Prompts.py (W5 adds Specify_Agentic_Subtype)
     prompts = Specify_Agentic_Subtype(user_request)
@@ -671,10 +778,12 @@ def agentic_analyze(state: State) -> dict:
     # returns {"system": <str>, "user": <str>}. We adopt the same dict-based message
     # format that retrieve_data uses so the pattern is consistent across all nodes.
     prompts = Agentic_Analyze_Prompt(user_request, schema_str)
-    messages = [
-        {"role": "system", "content": prompts["system"]},
-        {"role": "user",   "content": prompts["user"]},
-    ]
+    messages, resumed = _restore_agentic_messages(
+        state,
+        system_prompt=prompts["system"],
+        initial_user_prompt=prompts["user"],
+        follow_up_user_request=user_request,
+    )
 
     # All tools available to this node. voice_ask_user enables mid-loop TTS
     # clarification. No chart or code-execution tools — output is spoken JSON.
@@ -702,6 +811,13 @@ def agentic_analyze(state: State) -> dict:
     # (e.g., classify_agentic_subtype might append a classification entry).
     iteration_log = list(state.get("iteration_log") or [])
     final_response = ""
+    if resumed:
+        iteration_log.append({
+            "iter":       len(iteration_log),
+            "model":      "session-resume",
+            "tool_calls": [],
+            "summary":    "restored prior agentic_analyze conversation history",
+        })
 
     for i in range(MAX_ITERATIONS):
         response = llm.invoke(messages)
@@ -791,6 +907,7 @@ def agentic_analyze(state: State) -> dict:
         "response":        final_response,
         "iteration_log":   iteration_log,
         "agentic_subtype": "agentic_analyze",
+        "conversation_messages": _serialise_agentic_messages(messages),
     }
 
 
@@ -851,10 +968,12 @@ def agentic_explore(state: State) -> dict:
     # returns {"system": <str>, "user": <str>}. We use the same dict-based message
     # format as agentic_analyze for consistency across all nodes in the pipeline.
     prompts = Agentic_Explore_Prompt(user_request, schema_str)
-    messages = [
-        {"role": "system", "content": prompts["system"]},
-        {"role": "user",   "content": prompts["user"]},
-    ]
+    messages, resumed = _restore_agentic_messages(
+        state,
+        system_prompt=prompts["system"],
+        initial_user_prompt=prompts["user"],
+        follow_up_user_request=user_request,
+    )
 
     # Full tool list for explore: chart rendering + narration, code execution
     # (with user permission gate), codebase inspection, voice dialogue, and all
@@ -892,6 +1011,13 @@ def agentic_explore(state: State) -> dict:
     # (e.g., classify_agentic_subtype might append a classification entry).
     iteration_log = list(state.get("iteration_log") or [])
     final_response = ""
+    if resumed:
+        iteration_log.append({
+            "iter":       len(iteration_log),
+            "model":      "session-resume",
+            "tool_calls": [],
+            "summary":    "restored prior agentic_explore conversation history",
+        })
 
     for i in range(MAX_ITERATIONS):
         response = llm.invoke(messages)
@@ -994,4 +1120,5 @@ def agentic_explore(state: State) -> dict:
         "response":        final_response,
         "iteration_log":   iteration_log,
         "agentic_subtype": "agentic_explore",
+        "conversation_messages": _serialise_agentic_messages(messages),
     }
