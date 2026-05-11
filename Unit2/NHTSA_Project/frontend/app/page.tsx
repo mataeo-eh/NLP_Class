@@ -416,7 +416,7 @@ export default function HomePage() {
       });
 
       if (!response.ok) {
-        appendLog(`audio HTTP ${response.status} — ${await response.text()}`);
+        appendLog(`audio HTTP ${response.status} - ${await response.text()}`);
         return;
       }
 
@@ -481,7 +481,7 @@ export default function HomePage() {
       });
 
       if (!response.ok || !response.body) {
-        appendLog(`audio HTTP ${response.status} — ${await response.text()}`);
+        appendLog(`audio HTTP ${response.status} - ${await response.text()}`);
         return;
       }
 
@@ -620,7 +620,7 @@ export default function HomePage() {
       });
 
       if (!response.ok) {
-        appendLog(`transcribe HTTP ${response.status} — ${await response.text()}`);
+        appendLog(`transcribe HTTP ${response.status} - ${await response.text()}`);
         setAssistantStatus("Transcription failed. Try again or type your request.");
         return;
       }
@@ -760,7 +760,7 @@ export default function HomePage() {
         method: "POST",
       });
       if (!response.ok) {
-        appendLog(`warmup HTTP ${response.status} — ${await response.text()}`);
+        appendLog(`warmup HTTP ${response.status} - ${await response.text()}`);
         setAssistantStatus("Warmup failed. Check the backend and try again.");
         return;
       }
@@ -871,7 +871,7 @@ export default function HomePage() {
         if (response.status === 409) {
           setCanContinueSession(false);
         }
-        appendLog(`HTTP ${response.status} — ${await response.text()}`);
+        appendLog(`HTTP ${response.status} - ${await response.text()}`);
         setAssistantStatus("Pipeline request failed.");
         return;
       }
@@ -959,143 +959,230 @@ export default function HomePage() {
 
   const controlsDisabled =
     warmingUp || running || recording || transcribing || !backendBaseUrl;
+  const statusState = recording
+    ? "recording"
+    : running
+      ? "running"
+      : warmedUp
+        ? "ready"
+        : "idle";
+  const currentPhase = recording
+    ? "Recording"
+    : transcribing
+      ? "Transcribing"
+      : running
+        ? "Analyzing"
+        : warmingUp
+          ? "Warming up"
+          : warmedUp
+            ? "Ready"
+            : "Idle";
+  const backendStateLabel = backendBaseUrl ? "Connected" : "Missing";
+  const audioStateLabel = speaking ? "Speaking" : audioUrl ? "Audio ready" : "Silent";
+  const sessionModeLabel = canContinueSession ? "Follow-up mode" : "New request mode";
 
   return (
     <main className="page-shell">
-      <section className="card">
-        <p className="eyebrow">NHTSA Project</p>
-        <h1>Hosted audio pipeline</h1>
-        <p className="body-copy">
-          Run pipeline now warms up the hosted voice flow with the same greeting
-          the CLI uses. After that, you can either type a request or record one,
-          then send it into <code>/run</code> and hear both intermediate
-          narration and the final response through streamed TTS.
-        </p>
-        <p className="meta-copy">
-          Backend base URL:{" "}
-          {backendBaseUrl ? (
-            <a href={backendBaseUrl} target="_blank" rel="noreferrer">
-              {backendBaseUrl}
-            </a>
-          ) : (
-            <strong>missing NEXT_PUBLIC_API_BASE_URL</strong>
-          )}
-        </p>
-
-        <div
-          className="status-box"
-          data-state={
-            recording
-              ? "recording"
-              : running
-                ? "running"
-                : warmedUp
-                  ? "ready"
-                  : "idle"
-          }
-        >
-          {assistantStatus}
+      <section className="top-bar" aria-label="Project header">
+        <div className="brand-lockup">
+          <span className="brand-mark" aria-hidden="true">
+            N
+          </span>
+          <div>
+            <p className="eyebrow">NHTSA Project</p>
+            <h1>Voice analysis console</h1>
+          </div>
         </div>
+        <div className="backend-pill" data-connected={backendBaseUrl ? "true" : "false"}>
+          <span className="status-dot" aria-hidden="true" />
+          {backendStateLabel}
+        </div>
+      </section>
 
-        <p className="session-copy">
-          Conversation ID: <code>{conversationId}</code>
-          {canContinueSession ? " (follow-ups will reuse the current agentic session)" : ""}
-        </p>
+      <section className="hero-band" aria-label="Pipeline overview">
+        <div>
+          <p className="section-kicker">Hosted audio pipeline</p>
+          <p className="hero-copy">
+            Warm up the voice flow, send typed or recorded requests, and review
+            streamed narration from the NHTSA analysis backend.
+          </p>
+        </div>
+        <div className="signal-strip" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+          <span />
+        </div>
+      </section>
 
-        <div className="conversation-panel">
-          <p className="conversation-title">Conversation transcript</p>
-          {chatTurns.length === 0 ? (
-            <p className="conversation-empty">
-              Your requests and the assistant&apos;s final responses will appear here.
-            </p>
-          ) : (
-            <div className="conversation-list">
-              {chatTurns.map((turn, index) => (
-                <article
-                  key={`${turn.role}-${index}`}
-                  className="conversation-turn"
-                  data-role={turn.role}
-                >
-                  <p className="conversation-role">
-                    {turn.role === "user" ? "You" : "Assistant"}
-                  </p>
-                  <p className="conversation-text">{turn.text}</p>
-                </article>
-              ))}
+      <section className="dashboard-layout">
+        <aside className="side-panel" aria-label="Session status">
+          <div className="status-box" data-state={statusState}>
+            <p className="status-label">{currentPhase}</p>
+            <p className="status-message">{assistantStatus}</p>
+          </div>
+
+          <div className="metric-grid">
+            <div className="metric-tile">
+              <span>Backend</span>
+              <strong>{backendStateLabel}</strong>
             </div>
-          )}
-        </div>
+            <div className="metric-tile">
+              <span>Audio</span>
+              <strong>{audioStateLabel}</strong>
+            </div>
+            <div className="metric-tile metric-wide">
+              <span>Session</span>
+              <strong>{sessionModeLabel}</strong>
+            </div>
+          </div>
 
-        <textarea
-          value={request}
-          onChange={(e) => setRequest(e.target.value)}
-          rows={4}
-          className="request-input"
-          placeholder="Type what you want to say, or use the push-to-talk button below."
-          disabled={!warmedUp || warmingUp || running || recording || transcribing}
-        />
+          <div className="session-panel">
+            <p className="panel-title">Conversation ID</p>
+            <code>{conversationId}</code>
+          </div>
 
-        <div className="action-row">
-          <button
-            type="button"
-            onClick={handleWarmup}
-            disabled={controlsDisabled || speaking}
-          >
-            {warmingUp ? "Warming up..." : "Run pipeline"}
-          </button>
-          <button
-            type="button"
-            onClick={handleSendMessage}
-            disabled={
-              !warmedUp ||
-              warmingUp ||
-              running ||
-              recording ||
-              transcribing ||
-              request.trim().length === 0 ||
-              !backendBaseUrl
-            }
-          >
-            {running ? "Sending..." : "Send message"}
-          </button>
-          <button
-            type="button"
-            onClick={startNewConversation}
-            disabled={warmingUp || running || recording || transcribing}
-          >
-            New conversation
-          </button>
-          <button
-            type="button"
-            onClick={toggleRecording}
-            disabled={warmingUp || running || transcribing || !backendBaseUrl}
-            className={recording ? "recording-button" : undefined}
-          >
-            {recording
-              ? "Press when finished talking"
-              : transcribing
-                ? "Transcribing..."
-                : "Press to begin talking"}
-          </button>
-          <button
-            type="button"
-            onClick={replayAudio}
-            disabled={warmingUp || running || speaking || !finalResponse || !backendBaseUrl}
-          >
-            {speaking ? "Speaking..." : "Replay audio"}
-          </button>
-        </div>
+          <div className="backend-panel">
+            <p className="panel-title">Backend base URL</p>
+            {backendBaseUrl ? (
+              <a href={backendBaseUrl} target="_blank" rel="noreferrer">
+                {backendBaseUrl}
+              </a>
+            ) : (
+              <strong>missing NEXT_PUBLIC_API_BASE_URL</strong>
+            )}
+          </div>
+        </aside>
 
-        {audioUrl ? (
-          <audio
-            ref={audioElementRef}
-            className="audio-player"
-            src={audioUrl}
-            controls
-            preload="metadata"
+        <section className="workspace-panel" aria-label="Conversation workspace">
+          <div className="panel-heading">
+            <div>
+              <p className="section-kicker">Transcript</p>
+              <h2>Conversation</h2>
+            </div>
+            {canContinueSession ? (
+              <span className="mode-badge">Continuing session</span>
+            ) : (
+              <span className="mode-badge">Fresh request</span>
+            )}
+          </div>
+
+          <div className="conversation-panel">
+            {chatTurns.length === 0 ? (
+              <div className="conversation-empty">
+                <p>No transcript yet.</p>
+                <span>
+                  Warm up the pipeline, then type or record a request to start
+                  the analysis.
+                </span>
+              </div>
+            ) : (
+              <div className="conversation-list">
+                {chatTurns.map((turn, index) => (
+                  <article
+                    key={`${turn.role}-${index}`}
+                    className="conversation-turn"
+                    data-role={turn.role}
+                  >
+                    <p className="conversation-role">
+                      {turn.role === "user" ? "You" : "Assistant"}
+                    </p>
+                    <p className="conversation-text">{turn.text}</p>
+                  </article>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <label className="composer-label" htmlFor="request-input">
+            Message
+          </label>
+          <textarea
+            id="request-input"
+            value={request}
+            onChange={(e) => setRequest(e.target.value)}
+            rows={4}
+            className="request-input"
+            placeholder="Ask about vehicle safety, recalls, or crash-analysis context."
+            disabled={!warmedUp || warmingUp || running || recording || transcribing}
           />
-        ) : null}
 
+          <div className="action-row">
+            <button
+              type="button"
+              className="button button-primary"
+              onClick={handleWarmup}
+              disabled={controlsDisabled || speaking}
+            >
+              {warmingUp ? "Warming up..." : "Run pipeline"}
+            </button>
+            <button
+              type="button"
+              className="button button-primary button-accent"
+              onClick={handleSendMessage}
+              disabled={
+                !warmedUp ||
+                warmingUp ||
+                running ||
+                recording ||
+                transcribing ||
+                request.trim().length === 0 ||
+                !backendBaseUrl
+              }
+            >
+              {running ? "Sending..." : "Send message"}
+            </button>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={toggleRecording}
+              disabled={warmingUp || running || transcribing || !backendBaseUrl}
+              data-recording={recording ? "true" : "false"}
+            >
+              {recording
+                ? "Finish recording"
+                : transcribing
+                  ? "Transcribing..."
+                  : "Record voice"}
+            </button>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={replayAudio}
+              disabled={warmingUp || running || speaking || !finalResponse || !backendBaseUrl}
+            >
+              {speaking ? "Speaking..." : "Replay audio"}
+            </button>
+            <button
+              type="button"
+              className="button button-ghost"
+              onClick={startNewConversation}
+              disabled={warmingUp || running || recording || transcribing}
+            >
+              New conversation
+            </button>
+          </div>
+
+          {audioUrl ? (
+            <audio
+              ref={audioElementRef}
+              className="audio-player"
+              src={audioUrl}
+              controls
+              preload="metadata"
+            />
+          ) : null}
+        </section>
+      </section>
+
+      <section className="log-panel" aria-label="Backend event stream">
+        <div className="panel-heading compact">
+          <div>
+            <p className="section-kicker">Live stream</p>
+            <h2>Event log</h2>
+          </div>
+          <span className="log-count">{log ? "Events received" : "Waiting"}</span>
+        </div>
         <pre className="event-log">{log || "(no events yet)"}</pre>
       </section>
     </main>
