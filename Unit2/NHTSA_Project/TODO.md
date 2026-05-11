@@ -1,8 +1,5 @@
-Go through the complaints and determine which subsystem is being complained about. 
-Create a bar chart of the subsystem complaints 
-
-Prepare a short (2-5 slides) PPT to present
-    I chose Dynabench
-
-Research RLHF - DPO - and MMLU
-    - Quick research, be ready to do some talking about em
+Create some pre-built prompts engineered to go down each of the available pathways
+    - retrieve
+    - analyze
+    - agentic retrieve
+    - agentci retrieve and analyze
