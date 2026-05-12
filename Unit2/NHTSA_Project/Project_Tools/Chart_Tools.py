@@ -91,6 +91,9 @@ create_bar_chart = None  # type: ignore[assignment]
 create_human_subsystem_frequency_chart = None  # type: ignore[assignment]
 create_model_year_chart = None  # type: ignore[assignment]
 compare_LLM_to_NHTSA = None  # type: ignore[assignment]
+create_subsystem_frequency_by_make_chart = None  # type: ignore[assignment]
+create_subsystem_safety_signal_chart = None  # type: ignore[assignment]
+create_model_year_trend_chart = None  # type: ignore[assignment]
 _CHART_BACKEND_READY = False
 _CHART_BACKEND_ERROR: str | None = None
 
@@ -108,6 +111,9 @@ try:
         create_human_subsystem_frequency_chart,
         create_model_year_chart,
         compare_LLM_to_NHTSA,
+        create_subsystem_frequency_by_make_chart,
+        create_subsystem_safety_signal_chart,
+        create_model_year_trend_chart,
     )
     _CHART_BACKEND_READY = True
 except ImportError as exc:
@@ -335,20 +341,9 @@ def create_bar_chart_tool(columns: list[str]) -> str:
           }
     """
     chart_name = "create_bar_chart"
-    if is_headless_mode() or not _CHART_BACKEND_READY:
-        return _headless_chart_refusal(chart_name)
     csv_path = OUTPUTS_DIR / "Specific_Subsystem_Prompt.csv"
 
-    # --- call underlying chart function ---
-    # create_bar_chart(csv_path, columns, output_dir) → returns last fig or None
-    # We pass OUTPUTS_DIR as output_dir so charts/ subfolder lands alongside
-    # the CSV (mirrors existing Charts.ipynb usage).
-    fig = create_bar_chart(str(csv_path), columns, str(OUTPUTS_DIR))
-
-    # --- build structured summary so the LLM can reason about the chart ----
-    # Load the CSV ourselves to compute per-column value_counts for the summary.
-    # We do this independently of the chart function to keep the summary
-    # deterministic even if the chart function's internals change.
+    # --- summary (always computed — drives frontend chart rendering) ---------
     import pandas as pd
     summary: dict = {
         "csv_path": str(csv_path),
@@ -360,7 +355,6 @@ def create_bar_chart_tool(columns: list[str]) -> str:
         for col in columns:
             if col in df.columns:
                 summary["columns_plotted"].append(col)
-                # Top 10 by frequency; convert int64 counts to plain int for JSON.
                 vc = df[col].value_counts().head(10)
                 summary["value_counts"][col] = {str(k): int(v) for k, v in vc.items()}
     except Exception as e:
@@ -368,12 +362,22 @@ def create_bar_chart_tool(columns: list[str]) -> str:
 
     _LAST_CHART_DATA[chart_name] = summary
 
-    # --- render and display ------------------------------------------------
-    if fig is None:
-        # All columns were missing from the CSV; nothing was rendered.
+    # Headless / no matplotlib: return summary without rendering.
+    # The web frontend will render the chart from the structured data above.
+    if is_headless_mode() or not _CHART_BACKEND_READY:
         return json.dumps({
             "chart_name": chart_name,
-            "display": "not rendered (no valid columns found)",
+            "rendered": False,
+            "summary": summary,
+        })
+
+    # --- local CLI: render and display -------------------------------------
+    fig = create_bar_chart(str(csv_path), columns, str(OUTPUTS_DIR))
+
+    if fig is None:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
             "summary": summary,
         })
 
@@ -382,6 +386,7 @@ def create_bar_chart_tool(columns: list[str]) -> str:
 
     return json.dumps({
         "chart_name": chart_name,
+        "rendered": True,
         "display": display_result,
         "summary": _LAST_CHART_DATA[chart_name],
     })
@@ -420,12 +425,8 @@ def create_model_year_chart_tool(include_year: bool = False) -> str:
           }
     """
     chart_name = "create_model_year_chart"
-    if is_headless_mode() or not _CHART_BACKEND_READY:
-        return _headless_chart_refusal(chart_name)
 
-    # --- build structured summary before rendering --------------------------
-    # We load the parquet to compute the top-5 summary independently so the
-    # LLM receives the data even if chart rendering later fails.
+    # --- summary (always computed — drives frontend chart rendering) ---------
     import pandas as pd
     import numpy as np
 
@@ -442,7 +443,6 @@ def create_model_year_chart_tool(include_year: bool = False) -> str:
         model_col = df.columns[4]
         year_col  = df.columns[5]
 
-        # Build the same vehicle key used by the chart function.
         make_model = (
             df[make_col].astype(str).str.strip().str.upper()
             + " "
@@ -451,7 +451,6 @@ def create_model_year_chart_tool(include_year: bool = False) -> str:
 
         if include_year:
             def _extract_year_safe(val) -> str:
-                # Mirror the logic in create_model_year_chart._extract_year.
                 if isinstance(val, np.ndarray):
                     if val.size == 0:
                         return "UNKNOWN"
@@ -479,14 +478,21 @@ def create_model_year_chart_tool(include_year: bool = False) -> str:
 
     _LAST_CHART_DATA[chart_name] = summary
 
-    # --- call underlying chart function ------------------------------------
-    # create_model_year_chart(df_path, *, include_year) → returns fig or None
+    # Headless / no matplotlib: return summary without rendering.
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
+            "summary": summary,
+        })
+
+    # --- local CLI: render and display -------------------------------------
     fig = create_model_year_chart(str(PARQUET_PATH), include_year=include_year)
 
     if fig is None:
         return json.dumps({
             "chart_name": chart_name,
-            "display": "not rendered (data load failed)",
+            "rendered": False,
             "summary": summary,
         })
 
@@ -495,6 +501,7 @@ def create_model_year_chart_tool(include_year: bool = False) -> str:
 
     return json.dumps({
         "chart_name": chart_name,
+        "rendered": True,
         "display": display_result,
         "summary": _LAST_CHART_DATA[chart_name],
     })
@@ -543,8 +550,6 @@ def create_human_subsystem_frequency_chart_tool(
           }
     """
     chart_name = "create_human_subsystem_frequency_chart"
-    if is_headless_mode() or not _CHART_BACKEND_READY:
-        return _headless_chart_refusal(chart_name)
     filters = filters or {}
     top_n = max(1, min(int(top_n), 30))
 
@@ -625,6 +630,15 @@ def create_human_subsystem_frequency_chart_tool(
 
     _LAST_CHART_DATA[chart_name] = summary
 
+    # Headless / no matplotlib: return summary without rendering.
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
+            "summary": summary,
+        })
+
+    # --- local CLI: render and display -------------------------------------
     fig = create_human_subsystem_frequency_chart(
         str(PARQUET_PATH),
         filters=filters,
@@ -634,7 +648,7 @@ def create_human_subsystem_frequency_chart_tool(
     if fig is None:
         return json.dumps({
             "chart_name": chart_name,
-            "display": "not rendered (no matching data or data load failed)",
+            "rendered": False,
             "summary": summary,
         })
 
@@ -643,6 +657,7 @@ def create_human_subsystem_frequency_chart_tool(
 
     return json.dumps({
         "chart_name": chart_name,
+        "rendered": True,
         "display": display_result,
         "summary": _LAST_CHART_DATA[chart_name],
     })
@@ -1206,10 +1221,8 @@ def compare_LLM_to_NHTSA_tool() -> str:
           }
     """
     chart_name = "compare_LLM_to_NHTSA"
-    if is_headless_mode() or not _CHART_BACKEND_READY:
-        return _headless_chart_refusal(chart_name)
-    csv_path     = OUTPUTS_DIR / "Specific_Subsystem_Prompt.csv"
 
+    # --- summary (always computed — drives frontend chart rendering) ---------
     summary = _build_csv_parquet_label_comparison(
         filename="Specific_Subsystem_Prompt.csv",
         llm_label_column="subsystems",
@@ -1222,14 +1235,22 @@ def compare_LLM_to_NHTSA_tool() -> str:
 
     _LAST_CHART_DATA[chart_name] = summary
 
-    # --- call underlying chart function ------------------------------------
-    # compare_LLM_to_NHTSA(csv_path, parquet_path) → returns fig or None
+    # Headless / no matplotlib: return summary without rendering.
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
+            "summary": summary,
+        })
+
+    # --- local CLI: render and display -------------------------------------
+    csv_path = OUTPUTS_DIR / "Specific_Subsystem_Prompt.csv"
     fig = compare_LLM_to_NHTSA(str(csv_path), str(PARQUET_PATH))
 
     if fig is None:
         return json.dumps({
             "chart_name": chart_name,
-            "display": "not rendered (data load failed)",
+            "rendered": False,
             "summary": summary,
         })
 
@@ -1238,6 +1259,481 @@ def compare_LLM_to_NHTSA_tool() -> str:
 
     return json.dumps({
         "chart_name": chart_name,
+        "rendered": True,
+        "display": display_result,
+        "summary": _LAST_CHART_DATA[chart_name],
+    })
+
+
+@tool
+def create_subsystem_frequency_by_make_chart_tool(
+    makes: list[str] | None = None,
+    top_n: int = 8,
+) -> str:
+    """
+    Render a per-make breakdown of the most frequent human-labelled subsystem
+    components (COMPDESC) from complaints_cleaned.parquet.
+
+    Each vehicle make gets its own subplot showing the top `top_n` subsystem
+    labels for complaints associated with that make. If `makes` is omitted,
+    the chart uses the four most common makes in the full database automatically.
+
+    Use this chart when the user wants to compare which subsystem components
+    are most reported across different vehicle manufacturers.
+
+    Examples:
+      makes=["TOYOTA", "FORD"]           # compare two specific makes
+      makes=None                         # auto-select top-4 makes
+      makes=["HONDA", "GM", "CHRYSLER", "BMW"]
+
+    IMPORTANT — you CANNOT see the rendered chart image.
+    After calling this tool, read the structured summary in the returned JSON
+    (key: "summary") or call describe_chart_data("create_subsystem_frequency_by_make_chart")
+    to retrieve it again.  Use the summary to describe findings to the user.
+
+    Parameters
+    ----------
+    makes : list[str] | None
+        Vehicle make names to include (case-insensitive). When None, the four
+        most common makes in the database are selected automatically.
+    top_n : int, default 8
+        Number of top subsystem labels to plot per make. Capped internally at 15.
+
+    Returns
+    -------
+    str
+        JSON string with keys:
+          "chart_name" : "create_subsystem_frequency_by_make_chart"
+          "display"    : how the chart was opened
+          "summary"    : {
+              "makes_requested" : list[str] | "auto (top 4)",
+              "top_n"           : int,
+              "makes_plotted"   : [
+                  {
+                      "make"            : str,
+                      "complaint_count" : int,
+                      "top_components"  : [{"component": str, "count": int}, ...]
+                  }, ...
+              ]
+          }
+    """
+    chart_name = "create_subsystem_frequency_by_make_chart"
+    top_n = max(1, min(int(top_n), 15))
+
+    import pandas as pd
+    import numpy as np
+
+    def _first_clean(value) -> str:
+        # Mirror _first_clean_value from Create_Charts for the summary computation.
+        if value is None:
+            return ""
+        if isinstance(value, np.ndarray):
+            value = value.flat[0] if value.size > 0 else None
+        elif isinstance(value, list):
+            value = value[0] if value else None
+        if value is None:
+            return ""
+        try:
+            if pd.isna(value):
+                return ""
+        except (TypeError, ValueError):
+            pass
+        return str(value).strip().upper()
+
+    def _flatten_labels(series) -> list[str]:
+        labels = []
+        for val in series:
+            if val is None:
+                continue
+            if isinstance(val, (np.ndarray, list)):
+                items = val.tolist() if isinstance(val, np.ndarray) else val
+            else:
+                items = [val]
+            for item in items:
+                try:
+                    if pd.isna(item):
+                        continue
+                except (TypeError, ValueError):
+                    pass
+                cleaned = str(item).strip().upper()
+                if cleaned:
+                    labels.append(cleaned)
+        return labels
+
+    summary: dict = {
+        "makes_requested": makes if makes else "auto (top 4)",
+        "top_n": top_n,
+        "makes_plotted": [],
+    }
+
+    try:
+        df = pd.read_parquet(PARQUET_PATH)
+        df["_make_key"] = df["MAKETXT"].apply(_first_clean)
+
+        selected_makes = (
+            [str(m).strip().upper() for m in makes]
+            if makes
+            else df["_make_key"].value_counts().head(4).index.tolist()
+        )
+
+        for make in selected_makes:
+            make_df = df[df["_make_key"] == make]
+            labels = _flatten_labels(make_df["COMPDESC"])
+            counts = pd.Series(labels).value_counts().head(top_n)
+            summary["makes_plotted"].append({
+                "make": make,
+                "complaint_count": int(len(make_df)),
+                "top_components": [
+                    {"component": str(comp), "count": int(cnt)}
+                    for comp, cnt in counts.items()
+                ],
+            })
+    except Exception as e:
+        summary["error"] = str(e)
+
+    _LAST_CHART_DATA[chart_name] = summary
+
+    # Headless / no matplotlib: return summary without rendering.
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
+            "summary": summary,
+        })
+
+    # --- local CLI: render and display -------------------------------------
+    fig = create_subsystem_frequency_by_make_chart(
+        str(PARQUET_PATH),
+        makes=makes,
+        top_n=top_n,
+    )
+
+    if fig is None:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
+            "summary": summary,
+        })
+
+    png = _render_fig_to_png(fig)
+    display_result = _display_png_bytes(png, chart_name)
+
+    return json.dumps({
+        "chart_name": chart_name,
+        "rendered": True,
+        "display": display_result,
+        "summary": _LAST_CHART_DATA[chart_name],
+    })
+
+
+@tool
+def create_subsystem_safety_signal_chart_tool(
+    top_n: int = 15,
+    min_complaints: int = 100,
+) -> str:
+    """
+    Render a three-panel safety-signal chart breaking down crash rate, fire rate,
+    injury rate, and fatality rate by human-labelled subsystem component (COMPDESC).
+
+    Panel 1: Complaint volume (raw count of component-label occurrences).
+    Panel 2: Crash rate (%) and fire rate (%) — fraction of complaints flagged
+             as involving a crash or fire for that subsystem.
+    Panel 3: Injury rate and fatality rate per 1,000 complaints.
+
+    Data source: complaints_cleaned.parquet. Components are ranked by complaint
+    volume, then filtered to those with at least `min_complaints` occurrences.
+    NHTSA COMPDESC labels are exploded so each complaint may contribute to
+    multiple component rows if it carries more than one label.
+
+    Use this chart when the user asks which subsystems are most dangerous,
+    most crash-prone, or most associated with injuries and deaths.
+
+    IMPORTANT — you CANNOT see the rendered chart image.
+    After calling this tool, read the structured summary in the returned JSON
+    (key: "summary") or call describe_chart_data("create_subsystem_safety_signal_chart")
+    to retrieve it again.  Use the summary to describe findings to the user.
+
+    Parameters
+    ----------
+    top_n : int, default 15
+        Number of top-volume components to include (after min_complaints filter).
+        Capped internally at 25.
+    min_complaints : int, default 100
+        Minimum number of component-label occurrences a subsystem must have to
+        appear in the chart. Filters out low-volume noise.
+
+    Returns
+    -------
+    str
+        JSON string with keys:
+          "chart_name" : "create_subsystem_safety_signal_chart"
+          "display"    : how the chart was opened
+          "summary"    : {
+              "top_n"           : int,
+              "min_complaints"  : int,
+              "components"      : [
+                  {
+                      "component"            : str,
+                      "complaints"           : int,
+                      "crash_rate_pct"       : float,
+                      "fire_rate_pct"        : float,
+                      "injury_rate_per_1k"   : float,
+                      "death_rate_per_1k"    : float
+                  }, ...
+              ]
+          }
+    """
+    chart_name = "create_subsystem_safety_signal_chart"
+    top_n = max(1, min(int(top_n), 25))
+    min_complaints = max(1, int(min_complaints))
+
+    import pandas as pd
+    import numpy as np
+
+    def _is_missing(value) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, (np.ndarray, list)):
+            return len(value) == 0
+        try:
+            return bool(pd.isna(value))
+        except (TypeError, ValueError):
+            return False
+
+    def _cell_vals(value) -> list:
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, list):
+            return value
+        return [value]
+
+    def _binary_yes(value) -> bool:
+        if isinstance(value, (np.ndarray, list)):
+            items = value.tolist() if isinstance(value, np.ndarray) else value
+            return any(str(v).strip().upper() == "Y" for v in items if v is not None)
+        return str(value).strip().upper() == "Y"
+
+    def _numeric(value) -> float:
+        if isinstance(value, (np.ndarray, list)):
+            items = value.tolist() if isinstance(value, np.ndarray) else value
+            return float(items[0]) if items else 0.0
+        try:
+            return float(value) if not pd.isna(value) else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
+    summary: dict = {
+        "top_n": top_n,
+        "min_complaints": min_complaints,
+        "components": [],
+    }
+
+    try:
+        df = pd.read_parquet(PARQUET_PATH)
+        records = []
+        for _, row in df.iterrows():
+            for component in _cell_vals(row["COMPDESC"]):
+                if _is_missing(component):
+                    continue
+                cleaned = str(component).strip().upper()
+                if not cleaned:
+                    continue
+                records.append({
+                    "component": cleaned,
+                    "crash":   int(_binary_yes(row["CRASH"])),
+                    "fire":    int(_binary_yes(row["FIRE"])),
+                    "injured": _numeric(row["INJURED"]),
+                    "deaths":  _numeric(row["DEATHS"]),
+                })
+
+        if records:
+            long_df = pd.DataFrame(records)
+            agg = (
+                long_df.groupby("component")
+                .agg(
+                    complaints=("component", "size"),
+                    crashes=("crash", "sum"),
+                    fires=("fire", "sum"),
+                    injuries=("injured", "sum"),
+                    deaths=("deaths", "sum"),
+                )
+                .reset_index()
+            )
+            agg = agg[agg["complaints"] >= min_complaints]
+            agg = agg.sort_values("complaints", ascending=False).head(top_n)
+
+            for _, r in agg.iterrows():
+                n = float(r["complaints"])
+                summary["components"].append({
+                    "component":          str(r["component"]),
+                    "complaints":         int(r["complaints"]),
+                    "crash_rate_pct":     round(r["crashes"] / n * 100, 2),
+                    "fire_rate_pct":      round(r["fires"] / n * 100, 2),
+                    "injury_rate_per_1k": round(r["injuries"] / n * 1000, 2),
+                    "death_rate_per_1k":  round(r["deaths"] / n * 1000, 2),
+                })
+    except Exception as e:
+        summary["error"] = str(e)
+
+    _LAST_CHART_DATA[chart_name] = summary
+
+    # Headless / no matplotlib: return summary without rendering.
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
+            "summary": summary,
+        })
+
+    # --- local CLI: render and display -------------------------------------
+    fig = create_subsystem_safety_signal_chart(
+        str(PARQUET_PATH),
+        top_n=top_n,
+        min_complaints=min_complaints,
+    )
+
+    if fig is None:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
+            "summary": summary,
+        })
+
+    png = _render_fig_to_png(fig)
+    display_result = _display_png_bytes(png, chart_name)
+
+    return json.dumps({
+        "chart_name": chart_name,
+        "rendered": True,
+        "display": display_result,
+        "summary": _LAST_CHART_DATA[chart_name],
+    })
+
+
+@tool
+def create_model_year_trend_chart_tool(
+    min_year: int = 1990,
+    max_year: int | None = None,
+) -> str:
+    """
+    Render a bar chart of NHTSA complaint volume by vehicle model year.
+
+    Each bar represents one model year; height is the number of complaints.
+    The NHTSA unknown-year sentinel (9999) is always excluded. The top-5
+    highest-volume years are annotated directly on the chart.
+
+    Data source: complaints_cleaned.parquet, YEARTXT column.
+
+    Use this chart when the user wants to know which model years generate the
+    most complaints, or to see whether certain manufacturing eras are
+    overrepresented in the complaint database.
+
+    IMPORTANT — you CANNOT see the rendered chart image.
+    After calling this tool, read the structured summary in the returned JSON
+    (key: "summary") or call describe_chart_data("create_model_year_trend_chart")
+    to retrieve it again.  Use the summary to describe findings to the user.
+
+    Parameters
+    ----------
+    min_year : int, default 1990
+        Earliest model year to include. Years before this value are filtered out.
+    max_year : int | None, default None
+        Latest model year to include. When None, all years up to the most recent
+        in the database are included.
+
+    Returns
+    -------
+    str
+        JSON string with keys:
+          "chart_name" : "create_model_year_trend_chart"
+          "display"    : how the chart was opened
+          "summary"    : {
+              "min_year"               : int,
+              "max_year"               : int | None,
+              "total_complaints_in_range" : int,
+              "year_range"             : {"min": int, "max": int},
+              "top_5_years"            : [{"year": int, "count": int}, ...]
+          }
+    """
+    chart_name = "create_model_year_trend_chart"
+
+    import pandas as pd
+    import numpy as np
+
+    def _extract_year(value) -> int | None:
+        # Mirror _extract_model_year from Create_Charts.
+        if isinstance(value, np.ndarray):
+            if value.size == 0:
+                return None
+            value = value.flat[0]
+        elif isinstance(value, list):
+            if not value:
+                return None
+            value = value[0]
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        year = int(value)
+        return None if year == 9999 else year
+
+    summary: dict = {
+        "min_year": min_year,
+        "max_year": max_year,
+        "total_complaints_in_range": 0,
+        "year_range": {},
+        "top_5_years": [],
+    }
+
+    try:
+        df = pd.read_parquet(PARQUET_PATH)
+        years = df["YEARTXT"].apply(_extract_year).dropna().astype(int)
+        years = years[years >= int(min_year)]
+        if max_year is not None:
+            years = years[years <= int(max_year)]
+
+        summary["total_complaints_in_range"] = int(len(years))
+        if not years.empty:
+            counts = years.value_counts().sort_index()
+            summary["year_range"] = {"min": int(counts.index.min()), "max": int(counts.index.max())}
+            top5 = counts.sort_values(ascending=False).head(5)
+            summary["top_5_years"] = [
+                {"year": int(yr), "count": int(cnt)} for yr, cnt in top5.items()
+            ]
+    except Exception as e:
+        summary["error"] = str(e)
+
+    _LAST_CHART_DATA[chart_name] = summary
+
+    # Headless / no matplotlib: return summary without rendering.
+    if is_headless_mode() or not _CHART_BACKEND_READY:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
+            "summary": summary,
+        })
+
+    # --- local CLI: render and display -------------------------------------
+    fig = create_model_year_trend_chart(
+        str(PARQUET_PATH),
+        min_year=min_year,
+        max_year=max_year,
+    )
+
+    if fig is None:
+        return json.dumps({
+            "chart_name": chart_name,
+            "rendered": False,
+            "summary": summary,
+        })
+
+    png = _render_fig_to_png(fig)
+    display_result = _display_png_bytes(png, chart_name)
+
+    return json.dumps({
+        "chart_name": chart_name,
+        "rendered": True,
         "display": display_result,
         "summary": _LAST_CHART_DATA[chart_name],
     })
@@ -1258,6 +1754,9 @@ def describe_chart_data(chart_name: str) -> str:
       - "create_model_year_chart"
       - "create_human_subsystem_frequency_chart"
       - "compare_LLM_to_NHTSA"
+      - "create_subsystem_frequency_by_make_chart"
+      - "create_subsystem_safety_signal_chart"
+      - "create_model_year_trend_chart"
 
     Parameters
     ----------

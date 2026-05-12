@@ -84,6 +84,11 @@ set_headless_mode(True)
 # object exposed by Graph.py at module level via `app = graph.compile()`.
 # ---------------------------------------------------------------------------
 import Graph as _graph_module  # noqa: E402
+# Chart_Tools is transitively imported by Graph → Nodes → Chart_Tools.
+# We grab a reference to its module-level _LAST_CHART_DATA dict so we can:
+#   1. Clear it before each pipeline run (prevents cross-request contamination)
+#   2. Read it after the run to surface any chart summaries to the frontend
+import Project_Tools.Chart_Tools as _chart_tools_module  # noqa: E402
 
 graph_app = _graph_module.app
 WELCOME_TTS_TEXT = getattr(
@@ -256,6 +261,12 @@ async def stream_pipeline(
     The frontend can use the `event` field as the SSE event name (browsers
     subscribe to specific event names via `EventSource.addEventListener`).
     """
+    # Clear chart data from any prior run before this one starts.
+    # _LAST_CHART_DATA is a module-level dict shared across all requests in the
+    # same process; clearing it here ensures only charts from THIS run are
+    # surfaced in the completed event below.
+    _chart_tools_module._LAST_CHART_DATA.clear()
+
     working_state, resumed = _seed_state_for_request(user_request, prior_state)
     yield {
         "event": "started",
@@ -306,6 +317,10 @@ async def stream_pipeline(
 
         for narration_event in _drain_narration_events(narration_queue):
             yield narration_event
+        # Snapshot any chart summaries produced during this run.
+        # Each value is the structured summary dict already stored by the tool
+        # wrapper — safe to JSON-serialise via _to_jsonable.
+        charts_snapshot = _to_jsonable(dict(_chart_tools_module._LAST_CHART_DATA))
         yield {
             "event": "completed",
             "data": {
@@ -318,6 +333,9 @@ async def stream_pipeline(
                 "analysis_prompt_name": final_state.get("analysis_prompt_name", ""),
                 "row_count": len(final_state.get("query_result") or []),
                 "analysis_count": len(final_state.get("analysis") or []),
+                # chart summaries keyed by chart_name — empty dict when no
+                # chart tools were called during this run
+                "charts": charts_snapshot,
             },
         }
         if final_state_sink is not None:

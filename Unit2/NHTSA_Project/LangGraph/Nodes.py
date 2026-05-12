@@ -39,8 +39,6 @@ from LLM_Tools.NHTSA_Query_Tools import (
     get_csv_schema,
     filter_csv,
     get_csv_rows_by_position,
-    Ask_User,
-    User_Answer,
 )
 from LLM_Tools.MCP_To_Tools import (
     describe_stats_dataset,
@@ -74,6 +72,9 @@ from Project_Tools.Chart_Tools import (
     compare_LLM_to_NHTSA_tool,
     describe_chart_data,
     cleanup_temp_charts,
+    create_subsystem_frequency_by_make_chart_tool,
+    create_subsystem_safety_signal_chart_tool,
+    create_model_year_trend_chart_tool,
 )
 # code_exec is a LangChain @tool that executes a Python snippet ONLY after the
 # user explicitly approves it via voice — each call requires fresh permission.
@@ -326,8 +327,12 @@ def retrieve_data(state: State) -> dict:
     schema_str = build_schema_summary()
     prompts = Retrieve_Data_Prompt(user_request, schema_str)
 
-    # All 8 retrieval tools available in this node.
+    # All retrieval tools available in this node.
     # The tool map lets _dispatch_tool look up the callable by name from tool_call dicts.
+    # Chart tools are included because CSV outputs (Specific_Subsystem_Prompt.csv etc.)
+    # persist across runs — the analyze node appends to them but never deletes them, so
+    # the retrieval node can render charts from pre-existing data without requiring a
+    # prior analyze run in the same session.
     tool_list = [
         get_rows_by_position,
         filter_rows,
@@ -335,8 +340,21 @@ def retrieve_data(state: State) -> dict:
         get_csv_schema,
         filter_csv,
         get_csv_rows_by_position,
-        Ask_User,
-        User_Answer,
+        # Chart tools — render from parquet or persisted CSV files; safe to call here.
+        create_bar_chart_tool,
+        create_model_year_chart_tool,
+        create_human_subsystem_frequency_chart_tool,
+        create_subsystem_frequency_by_make_chart_tool,
+        create_subsystem_safety_signal_chart_tool,
+        create_model_year_trend_chart_tool,
+        compare_LLM_to_NHTSA_tool,
+        describe_chart_data,
+        # voice_ask_user replaces the old Ask_User + User_Answer two-step pair.
+        # It speaks the question via TTS, captures the spoken reply via STT, and
+        # returns the transcript — all in one tool call. On the hosted backend
+        # (where is_headless_mode() is True) it returns a structured refusal so
+        # the LLM proceeds with reasonable defaults instead of blocking on input().
+        voice_ask_user,
     ]
     tool_map = {t.name: t for t in tool_list}
 
@@ -1054,6 +1072,9 @@ def agentic_explore(state: State) -> dict:
         create_bar_chart_tool,
         create_model_year_chart_tool,
         create_human_subsystem_frequency_chart_tool,
+        create_subsystem_frequency_by_make_chart_tool,
+        create_subsystem_safety_signal_chart_tool,
+        create_model_year_trend_chart_tool,
         compare_csv_to_parquet_labels,
         build_csv_parquet_label_stats_dataset,
         compare_LLM_to_NHTSA_tool,
