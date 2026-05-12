@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
+from pydantic import ValidationError
 
 # Prompts.py and LLM_Tools/ both live one level up in NHTSA_Project/
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -31,6 +32,7 @@ from config import mercury_llm, gpt5_4_mini_llm, gpt5_1_llm
 from LLM_Tools.NHTSA_Query_Tools import (
     get_rows_by_position,
     filter_rows,
+    get_recent_complaints,
     count_complaints,
     group_complaints,
     summarize_complaints,
@@ -85,7 +87,10 @@ from Project_Tools.Codebase_Tools import list_project_files, read_file_section
 # is_headless_mode is consulted by confirm_csv_write to short-circuit the user
 # yes/no prompt when running on the FastAPI backend. The local CLI never sets
 # headless mode, so its existing prompt-the-user behaviour is preserved.
-from Project_Tools.Runtime_Options import is_headless_mode
+from Project_Tools.Runtime_Options import (
+    HostedUserInteractionRequired,
+    is_headless_mode,
+)
 # ---------------------------------------------------------------------------
 # Load environment variables from a .env file
 # ---------------------------------------------------------------------------
@@ -100,14 +105,14 @@ def _restore_agentic_messages(
     follow_up_user_request: str,
 ) -> tuple[list[Any], bool]:
     """
-    Rebuild the exact LangChain message stack for an agentic follow-up.
+    Rebuild the exact LangChain message stack for a resumed hosted tool loop.
 
     Why this helper exists:
-      The agentic nodes keep their conversational memory inside a local
+      Several nodes keep their conversational/tool memory inside a local
       llm.invoke(...) loop rather than in LangGraph-managed MessagesState.
-      That means a later /run follow-up must explicitly restore the prior
-      system / assistant / tool transcript if we want the model to remember
-      what it already retrieved or said.
+      That means a later /run follow-up or clarification-resume request must
+      explicitly restore the prior system / assistant / tool transcript if we
+      want the model to continue from the exact paused point.
 
     Return shape:
       (messages, resumed)
@@ -147,6 +152,31 @@ def _restore_agentic_messages(
         restored_messages[0] = SystemMessage(content=system_prompt)
     else:
         restored_messages.insert(0, SystemMessage(content=system_prompt))
+
+    pending_tool_call_id = str(state.get("pending_clarification_tool_call_id") or "").strip()
+    pending_answer = str(state.get("pending_clarification_answer") or "").strip()
+    pending_result_mode = str(state.get("pending_clarification_result_mode") or "").strip()
+
+    # Clarification resumes are special: the browser's latest submission is not
+    # a new conversational HumanMessage. It is the delayed result of an earlier
+    # tool call that paused the run, so we must stitch it back in as the missing
+    # ToolMessage for that original tool_call_id.
+    if pending_tool_call_id and pending_answer:
+        if pending_result_mode == "confirm_then_answer":
+            restored_messages.append(
+                ToolMessage(
+                    content="Question asked in hosted mode. Call User_Answer() to retrieve the response.",
+                    tool_call_id=pending_tool_call_id,
+                )
+            )
+        else:
+            restored_messages.append(
+                ToolMessage(
+                    content=pending_answer,
+                    tool_call_id=pending_tool_call_id,
+                )
+            )
+        return restored_messages, True
 
     # The new browser message is the latest human turn in the ongoing dialogue.
     restored_messages.append(HumanMessage(content=follow_up_user_request))
@@ -206,6 +236,208 @@ def _invoke_agentic_tool(
     raise ValueError(f"unknown tool {tool_name!r}")
 
 
+def _json_debug(value: Any) -> str:
+    """Serialize arbitrary values into readable JSON-ish text for logs/messages."""
+    try:
+        return json.dumps(value, indent=2, default=str, ensure_ascii=True)
+    except Exception:
+        return repr(value)
+
+
+def _tool_failure_record(
+    tool_name: str,
+    tool_args: Any,
+    exc: Exception,
+) -> dict[str, Any]:
+    """Normalize one tool failure into a structured record for logging and fallback UX."""
+    record = {
+        "tool_name": tool_name,
+        "tool_args": tool_args,
+        "error_type": type(exc).__name__,
+        "error_message": str(exc),
+    }
+    if isinstance(exc, ValidationError):
+        record["validation_errors"] = exc.errors()
+    else:
+        errors_attr = getattr(exc, "errors", None)
+        if callable(errors_attr):
+            try:
+                record["validation_errors"] = errors_attr()
+            except Exception:
+                pass
+    return record
+
+
+def _tool_failure_message(
+    tool_name: str,
+    tool_args: Any,
+    exc: Exception,
+) -> str:
+    """Return rich model-facing feedback so the next turn can repair the tool call."""
+    failure = _tool_failure_record(tool_name, tool_args, exc)
+    lines = [
+        "Tool call failed.",
+        f"tool_name: {tool_name}",
+        f"error_type: {failure['error_type']}",
+        f"error_message: {failure['error_message']}",
+        "tool_args:",
+        _json_debug(tool_args),
+    ]
+    validation_errors = failure.get("validation_errors")
+    if validation_errors is not None:
+        lines.extend([
+            "validation_errors:",
+            _json_debug(validation_errors),
+        ])
+    lines.append(
+        "next_step: Revise the arguments to satisfy the tool schema or choose a more appropriate tool, then try again. Do not repeat the same invalid call unchanged."
+    )
+    return "\n".join(lines)
+
+
+def _execute_tool_call_with_feedback(
+    tool_name: str,
+    tool_args: Any,
+    *,
+    tool_map: dict[str, Any],
+    remote_tool_names: set[str],
+    mcp_manager: Any,
+) -> tuple[str | None, dict[str, Any] | None, dict[str, Any] | None]:
+    """
+    Execute one tool call and convert any failure into model-readable feedback.
+
+    This keeps invalid tool calls inside the agent loop instead of aborting the
+    whole request. The returned string is fed back as ToolMessage content so the
+    model can repair its arguments on the next turn.
+    """
+    try:
+        result = _invoke_agentic_tool(
+            tool_name,
+            tool_args,
+            tool_map=tool_map,
+            remote_tool_names=remote_tool_names,
+            mcp_manager=mcp_manager,
+        )
+        return str(result), None, None
+    except HostedUserInteractionRequired as exc:
+        return None, None, {
+            "tool_name": tool_name,
+            "question": exc.question,
+            "result_mode": exc.result_mode,
+        }
+    except Exception as exc:
+        failure = _tool_failure_record(tool_name, tool_args, exc)
+        print("[tool-error]", _json_debug(failure))
+        return _tool_failure_message(tool_name, tool_args, exc), failure, None
+
+
+def _build_tool_failure_user_response(
+    *,
+    assistant_label: str,
+    tool_failures: list[dict[str, Any]],
+) -> str:
+    """Return a spoken fallback when repeated tool failures prevented completion."""
+    if not tool_failures:
+        return (
+            f"Sorry, {assistant_label} was unable to complete the request. "
+            "The issue has been logged, and you can keep exploring in the meantime."
+        )
+
+    unique_tool_names = sorted(
+        {str(failure.get("tool_name", "unknown_tool")) for failure in tool_failures}
+    )
+    if len(unique_tool_names) == 1:
+        tool_phrase = unique_tool_names[0]
+    elif len(unique_tool_names) == 2:
+        tool_phrase = f"{unique_tool_names[0]} and {unique_tool_names[1]}"
+    else:
+        tool_phrase = ", ".join(unique_tool_names[:3]) + ", and other tools"
+
+    return (
+        f"Sorry, {assistant_label} tried to call {tool_phrase} but was unable to "
+        "successfully complete the request after several retries. The error has "
+        "been logged, and you can continue exploring or try a reworded request "
+        "in the meantime."
+    )
+
+
+def _build_clarification_pause_state(
+    *,
+    messages: list[Any],
+    tool_call_id: str,
+    tool_name: str,
+    question: str,
+    result_mode: str,
+    response_text: str = "",
+) -> dict[str, Any]:
+    """
+    Capture a resumable clarification checkpoint for the hosted browser flow.
+
+    The returned dict is merged into State so the FastAPI adapter can persist the
+    paused transcript, emit a clarification-required SSE event, and later inject
+    the browser's answer back into the outstanding tool call.
+    """
+    return {
+        "response": response_text,
+        "conversation_messages": _serialise_agentic_messages(messages),
+        "awaiting_clarification": True,
+        "pending_clarification_question": question.strip(),
+        "pending_clarification_tool_call_id": tool_call_id,
+        "pending_clarification_tool_name": tool_name,
+        "pending_clarification_result_mode": result_mode,
+        "pending_clarification_answer": "",
+    }
+
+
+def _dispatch_parallel_tool_calls(
+    *,
+    tool_calls: list[dict[str, Any]],
+    messages: list[Any],
+    tool_map: dict[str, Any],
+    remote_tool_names: set[str],
+    mcp_manager: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Execute one model turn's tool calls in parallel and append ToolMessages.
+
+    Every failure is converted into a ToolMessage instead of being raised, which
+    lets the model inspect what went wrong and issue a corrected tool call on a
+    later turn.
+    """
+    tool_failures: list[dict[str, Any]] = []
+    clarification_requests: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max(1, len(tool_calls))) as executor:
+        futures = {
+            executor.submit(
+                _execute_tool_call_with_feedback,
+                tc["name"],
+                tc["args"],
+                tool_map=tool_map,
+                remote_tool_names=remote_tool_names,
+                mcp_manager=mcp_manager,
+            ): tc
+            for tc in tool_calls
+        }
+
+        for fut in as_completed(futures):
+            tc = futures[fut]
+            result, failure, clarification = fut.result()
+            if failure is not None:
+                tool_failures.append(failure)
+            if clarification is not None:
+                clarification_requests.append({
+                    **clarification,
+                    "tool_call_id": tc["id"],
+                })
+                continue
+            messages.append(ToolMessage(
+                content=str(result),
+                tool_call_id=tc["id"],
+            ))
+
+    return tool_failures, clarification_requests
+
+
 
 def classify_task(state: State) -> dict:
     user_request = state["user_request"]
@@ -221,6 +453,22 @@ def classify_task(state: State) -> dict:
     ):
         task_type = str(state["task_type"])
         narrate_node_result("classify_task", {"task_type": task_type, "resumed": True})
+        return {"task_type": task_type}
+
+    # Hosted clarification resumes should also preserve the previously selected
+    # task type even on the non-agentic branches. The user message on this /run
+    # call is just the delayed answer to an earlier tool question, not a brand
+    # new top-level request that should be reclassified from scratch.
+    if (
+        state.get("pending_clarification_answer")
+        and state.get("task_type")
+        and state.get("conversation_messages")
+    ):
+        task_type = str(state["task_type"])
+        narrate_node_result(
+            "classify_task",
+            {"task_type": task_type, "resumed": True, "from_clarification": True},
+        )
         return {"task_type": task_type}
 
     # Build system + user prompts from Prompts.py
@@ -336,6 +584,7 @@ def retrieve_data(state: State) -> dict:
     tool_list = [
         get_rows_by_position,
         filter_rows,
+        get_recent_complaints,
         list_csv_files,
         get_csv_schema,
         filter_csv,
@@ -352,8 +601,8 @@ def retrieve_data(state: State) -> dict:
         # voice_ask_user replaces the old Ask_User + User_Answer two-step pair.
         # It speaks the question via TTS, captures the spoken reply via STT, and
         # returns the transcript — all in one tool call. On the hosted backend
-        # (where is_headless_mode() is True) it returns a structured refusal so
-        # the LLM proceeds with reasonable defaults instead of blocking on input().
+        # it raises a structured clarification checkpoint so the browser can ask
+        # the human and the graph can resume from the exact tool call later.
         voice_ask_user,
     ]
     tool_map = {t.name: t for t in tool_list}
@@ -365,22 +614,27 @@ def retrieve_data(state: State) -> dict:
     DATA_TOOLS = {
         "get_rows_by_position",
         "filter_rows",
+        "get_recent_complaints",
         "filter_csv",
         "get_csv_rows_by_position",
     }
 
     llm = gpt5_1_llm.bind_tools(tool_list)
 
-    messages = [
-        {"role": "system", "content": prompts["system"]},
-        {"role": "user",   "content": prompts["user"]},
-    ]
+    messages, _resumed = _restore_agentic_messages(
+        state,
+        system_prompt=prompts["system"],
+        initial_user_prompt=prompts["user"],
+        follow_up_user_request=user_request,
+    )
 
     # Track the most recent successful data-tool result. The LLM may call tools
     # multiple times during the loop; we only keep the final fetched rows so
     # downstream nodes see exactly what the LLM ultimately decided to retrieve.
     last_data_rows: list[dict] = []
+    tool_failures: list[dict[str, Any]] = []
     final_response = "Retrieval reached max iterations without a final answer."
+    completed_without_final_answer = True
 
     # Bounded agentic loop — allows the LLM to call tools for clarification and data
     # fetching, but prevents runaway execution with a hard iteration cap.
@@ -393,16 +647,31 @@ def retrieve_data(state: State) -> dict:
         # the prose for state["response"] and exit the loop.
         if not response.tool_calls:
             final_response = response.content
+            completed_without_final_answer = False
             break
 
         # Execute each tool call and feed the results back into the message history
         for tool_call in response.tool_calls:
-            tool_fn = tool_map.get(tool_call["name"])
-            if tool_fn is None:
-                # Unknown tool — return an error message as the tool result
-                result = f"Error: unknown tool '{tool_call['name']}'"
-            else:
-                result = tool_fn.invoke(tool_call["args"])
+            result, failure, clarification = _execute_tool_call_with_feedback(
+                tool_call["name"],
+                tool_call["args"],
+                tool_map=tool_map,
+                remote_tool_names=set(),
+                mcp_manager=None,
+            )
+            if clarification is not None:
+                return {
+                    "query_result": last_data_rows,
+                    **_build_clarification_pause_state(
+                        messages=messages,
+                        tool_call_id=str(tool_call["id"]),
+                        tool_name=str(clarification["tool_name"]),
+                        question=str(clarification["question"]),
+                        result_mode=str(clarification["result_mode"]),
+                    ),
+                }
+            if failure is not None:
+                tool_failures.append(failure)
 
             # Capture parsed rows when a data-fetching tool returned a JSON array
             # of row dicts. Non-list payloads (error dicts, "no matches" messages)
@@ -419,6 +688,12 @@ def retrieve_data(state: State) -> dict:
             messages.append(
                 ToolMessage(content=str(result), tool_call_id=tool_call["id"])
             )
+
+    if completed_without_final_answer and tool_failures:
+        final_response = _build_tool_failure_user_response(
+            assistant_label="the retrieval agent",
+            tool_failures=tool_failures,
+        )
 
     # Shape query_result based on where the data is headed next:
     #   "analyze"  -> project to {index, CDESCR} only. The analyze node's prompts
@@ -894,6 +1169,7 @@ def agentic_analyze(state: State) -> dict:
     # Carry forward any log entries produced by earlier nodes in the same run
     # (e.g., classify_agentic_subtype might append a classification entry).
     iteration_log = list(state.get("iteration_log") or [])
+    tool_failures: list[dict[str, Any]] = []
     final_response = ""
     if resumed:
         iteration_log.append({
@@ -926,66 +1202,81 @@ def agentic_analyze(state: State) -> dict:
         tool_calls = response.tool_calls  # list of dicts: {name, args, id}
 
         # --- Parallel dispatch ---------------------------------------------------
-        # Submit all tool calls concurrently. Independent fetches (e.g., several
-        # row-range lookups, or a schema check alongside a filter call) complete
-        # in parallel rather than sequentially, reducing total wall time.
-        # Unknown tools receive an immediate error ToolMessage without spawning a
-        # future so the model knows what went wrong on the next turn.
-        with ThreadPoolExecutor(max_workers=max(1, len(tool_calls))) as executor:
-            futures = {}
-            for tc in tool_calls:
-                if tc["name"] not in tool_map and tc["name"] not in remote_tool_names:
-                    # Unknown tool — return an error immediately without a future.
-                    # Appending now (before as_completed) is safe because the
-                    # executor hasn't yielded this tc in any future.
-                    messages.append(ToolMessage(
-                        content=f"Tool error: unknown tool {tc['name']!r}",
-                        tool_call_id=tc["id"],
-                    ))
-                    continue
-                futures[executor.submit(
-                    _invoke_agentic_tool,
-                    tc["name"],
-                    tc["args"],
-                    tool_map=tool_map,
-                    remote_tool_names=remote_tool_names,
-                    mcp_manager=mcp_manager,
-                )] = tc
-
-            # Collect results as they complete (order not guaranteed, which is fine —
-            # each ToolMessage carries its tool_call_id for the model to correlate).
-            for fut in as_completed(futures):
-                tc = futures[fut]
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    # Surface tool errors as ToolMessages so the model can adapt
-                    # rather than silently losing a result.
-                    result = f"Tool error: {exc}"
-                messages.append(ToolMessage(
-                    content=str(result),
-                    tool_call_id=tc["id"],
-                ))
+        # Submit all tool calls concurrently. Every failure is turned into a
+        # rich ToolMessage so the model can repair the next call instead of
+        # crashing the whole agentic request.
+        iteration_failures, clarification_requests = _dispatch_parallel_tool_calls(
+            tool_calls=tool_calls,
+            messages=messages,
+            tool_map=tool_map,
+            remote_tool_names=remote_tool_names,
+            mcp_manager=mcp_manager,
+        )
+        tool_failures.extend(iteration_failures)
         # ------------------------------------------------------------------------
+
+        if clarification_requests:
+            clarification = clarification_requests[0]
+            iteration_log.append({
+                "iter":       i,
+                "model":      "gpt-5.1",
+                "tool_calls": [tc["name"] for tc in tool_calls],
+                "summary":    "paused for browser clarification before the next tool result",
+            })
+            return {
+                "response": "",
+                "iteration_log": iteration_log,
+                "agentic_subtype": "agentic_analyze",
+                **_build_clarification_pause_state(
+                    messages=messages,
+                    tool_call_id=str(clarification["tool_call_id"]),
+                    tool_name=str(clarification["tool_name"]),
+                    question=str(clarification["question"]),
+                    result_mode=str(clarification["result_mode"]),
+                ),
+            }
+
+        failure_count = len(iteration_failures)
+        summary = (
+            f"dispatched {len(tool_calls)} tool call(s) in parallel"
+            if failure_count == 0
+            else (
+                f"dispatched {len(tool_calls)} tool call(s) in parallel; "
+                f"{failure_count} failure(s) were returned to the model for self-correction"
+            )
+        )
+        narration_reasoning = (
+            summary
+            if failure_count == 0
+            else "the agent is correcting one or more tool calls and continuing the analysis"
+        )
 
         iteration_log.append({
             "iter":       i,
             "model":      "gpt-5.1",
             "tool_calls": [tc["name"] for tc in tool_calls],
-            "summary":    f"dispatched {len(tool_calls)} tool call(s) in parallel",
+            "summary":    summary,
+            "tool_error_count": failure_count,
         })
 
         narrate_node_result("agentic_iteration", {
             "iter":       i,
             "max_iter":   MAX_ITERATIONS,
             "tool_calls": [tc["name"] for tc in tool_calls],
-            "reasoning":  f"dispatched {len(tool_calls)} tool call(s) in parallel",
+            "reasoning":  narration_reasoning,
         })
 
     else:
         # Loop exhausted all 12 iterations without the model producing a tool-free
         # response. Record the cap-fallthrough and return a graceful degradation msg.
-        final_response = "Agentic analyze reached max iterations without a final answer."
+        final_response = (
+            _build_tool_failure_user_response(
+                assistant_label="the agent",
+                tool_failures=tool_failures,
+            )
+            if tool_failures
+            else "Agentic analyze reached max iterations without a final answer."
+        )
         iteration_log.append({
             "iter":       MAX_ITERATIONS,
             "model":      "gpt-5.1",
@@ -1111,6 +1402,7 @@ def agentic_explore(state: State) -> dict:
     # Carry forward any log entries produced by earlier nodes in the same run
     # (e.g., classify_agentic_subtype might append a classification entry).
     iteration_log = list(state.get("iteration_log") or [])
+    tool_failures: list[dict[str, Any]] = []
     final_response = ""
     if resumed:
         iteration_log.append({
@@ -1143,67 +1435,81 @@ def agentic_explore(state: State) -> dict:
         tool_calls = response.tool_calls  # list of dicts: {name, args, id}
 
         # --- Parallel dispatch ---------------------------------------------------
-        # Submit all tool calls concurrently. Independent operations (e.g., a chart
-        # render + a schema lookup, or two separate filter calls) complete in
-        # parallel rather than sequentially, reducing total wall time during the
-        # interactive dialogue loop.
-        # Unknown tools receive an immediate error ToolMessage without spawning a
-        # future so the model knows what went wrong on the next turn.
-        with ThreadPoolExecutor(max_workers=max(1, len(tool_calls))) as executor:
-            futures = {}
-            for tc in tool_calls:
-                if tc["name"] not in tool_map and tc["name"] not in remote_tool_names:
-                    # Unknown tool — return an error immediately without a future.
-                    # Appending now (before as_completed) is safe because the
-                    # executor hasn't yielded this tc in any future.
-                    messages.append(ToolMessage(
-                        content=f"Tool error: unknown tool {tc['name']!r}",
-                        tool_call_id=tc["id"],
-                    ))
-                    continue
-                futures[executor.submit(
-                    _invoke_agentic_tool,
-                    tc["name"],
-                    tc["args"],
-                    tool_map=tool_map,
-                    remote_tool_names=remote_tool_names,
-                    mcp_manager=mcp_manager,
-                )] = tc
-
-            # Collect results as they complete (order not guaranteed, which is fine —
-            # each ToolMessage carries its tool_call_id for the model to correlate).
-            for fut in as_completed(futures):
-                tc = futures[fut]
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    # Surface tool errors as ToolMessages so the model can adapt
-                    # rather than silently losing a result.
-                    result = f"Tool error: {exc}"
-                messages.append(ToolMessage(
-                    content=str(result),
-                    tool_call_id=tc["id"],
-                ))
+        # Submit all tool calls concurrently. Every failure is turned into a
+        # rich ToolMessage so the model can repair the next call instead of
+        # crashing the whole conversational request.
+        iteration_failures, clarification_requests = _dispatch_parallel_tool_calls(
+            tool_calls=tool_calls,
+            messages=messages,
+            tool_map=tool_map,
+            remote_tool_names=remote_tool_names,
+            mcp_manager=mcp_manager,
+        )
+        tool_failures.extend(iteration_failures)
         # ------------------------------------------------------------------------
+
+        if clarification_requests:
+            clarification = clarification_requests[0]
+            iteration_log.append({
+                "iter":       i,
+                "model":      "gpt-5.4-mini",
+                "tool_calls": [tc["name"] for tc in tool_calls],
+                "summary":    "paused for browser clarification before the next tool result",
+            })
+            return {
+                "response": "",
+                "iteration_log": iteration_log,
+                "agentic_subtype": "agentic_explore",
+                **_build_clarification_pause_state(
+                    messages=messages,
+                    tool_call_id=str(clarification["tool_call_id"]),
+                    tool_name=str(clarification["tool_name"]),
+                    question=str(clarification["question"]),
+                    result_mode=str(clarification["result_mode"]),
+                ),
+            }
+
+        failure_count = len(iteration_failures)
+        summary = (
+            f"dispatched {len(tool_calls)} tool call(s) in parallel"
+            if failure_count == 0
+            else (
+                f"dispatched {len(tool_calls)} tool call(s) in parallel; "
+                f"{failure_count} failure(s) were returned to the model for self-correction"
+            )
+        )
+        narration_reasoning = (
+            summary
+            if failure_count == 0
+            else "the agent is correcting one or more tool calls and continuing the exploration"
+        )
 
         iteration_log.append({
             "iter":       i,
             "model":      "gpt-5.4-mini",
             "tool_calls": [tc["name"] for tc in tool_calls],
-            "summary":    f"dispatched {len(tool_calls)} tool call(s) in parallel",
+            "summary":    summary,
+            "tool_error_count": failure_count,
         })
 
         narrate_node_result("agentic_iteration", {
             "iter":       i,
             "max_iter":   MAX_ITERATIONS,
             "tool_calls": [tc["name"] for tc in tool_calls],
-            "reasoning":  f"dispatched {len(tool_calls)} tool call(s) in parallel",
+            "reasoning":  narration_reasoning,
         })
 
     else:
         # Loop exhausted all 12 iterations without the model producing a tool-free
         # response. Record the cap-fallthrough and return a graceful degradation msg.
-        final_response = "Agentic explore reached max iterations without a final answer."
+        final_response = (
+            _build_tool_failure_user_response(
+                assistant_label="the agent",
+                tool_failures=tool_failures,
+            )
+            if tool_failures
+            else "Agentic explore reached max iterations without a final answer."
+        )
         iteration_log.append({
             "iter":       MAX_ITERATIONS,
             "model":      "gpt-5.4-mini",

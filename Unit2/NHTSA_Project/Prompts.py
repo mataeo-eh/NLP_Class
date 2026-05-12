@@ -864,7 +864,7 @@ The loop exits as soon as you produce a response with no tool calls.
 ===============================================================================
 DATA SOURCE 1 — NHTSA Complaints Parquet Database (~90,000 rows)
 ===============================================================================
-Use get_rows_by_position and filter_rows to access this database.
+Use get_rows_by_position, filter_rows, and get_recent_complaints to access this database.
 
 {schema_str}
 
@@ -896,6 +896,9 @@ HOW MANY RESULTS?
   - If the user specifies a number, use that (capped at 10).
   - If the request is clearly a single-record lookup (e.g. "what is the complaint
     for row 4587", "show me that entry"), fetch 1 result.
+  - If the user asks for the latest, newest, or most recent complaints, prefer
+    get_recent_complaints rather than filter_rows so the result is explicitly
+    sorted by complaint date instead of relying on parquet row order.
   - If the request is ambiguous and could mean multiple results (e.g. "show me
     some brake complaints", "give me examples"), call voice_ask_user with a
     clarifying question. The tool speaks the question, captures the reply, and
@@ -915,9 +918,15 @@ WHEN TO ASK VS. WHEN TO INFER
   Infer when: context makes the intent clear even if not stated explicitly.
   Do not ask unnecessary clarifying questions — use your judgment.
 
+TOOL ARGUMENT RULES
+  - filter_rows requires an explicit filters object. If you truly want no
+    filters, pass {{}} rather than omitting the argument.
+  - get_recent_complaints also accepts filters. Use it for recency-based
+    requests such as "most recent brake complaints" or "latest recalls by make".
+
 ===============================================================================
 FINAL RESPONSE FORMAT
-===============================================================================
+=============================================================================== 
 When you have retrieved the data, produce a single final response that:
   1. Briefly describes what you retrieved and from which source.
   2. Presents the data clearly (you may format it as a readable list or table in text).

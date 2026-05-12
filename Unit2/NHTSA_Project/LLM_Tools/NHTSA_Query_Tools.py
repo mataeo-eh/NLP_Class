@@ -13,6 +13,7 @@ Tool catalogue
 Parquet tools:
   get_rows_by_position     — fetch rows by explicit positions or random sample
   filter_rows              — fetch a small preview of matching complaint rows
+  get_recent_complaints    — fetch the newest complaints matching filters
   count_complaints         — exact full-dataset row count after filtering
   group_complaints         — exact full-dataset counts grouped by complaint columns
   summarize_complaints     — exact descriptive statistics for complaint columns
@@ -50,7 +51,12 @@ from LangGraph.config import mercury_llm
 # Import audio pipeline — TTS for Ask_User, STT for User_Answer
 # ---------------------------------------------------------------------------
 sys.path.insert(0, str(Path(__file__).parent.parent))
-from Project_Tools.Runtime_Options import is_audio_enabled
+from Project_Tools.Runtime_Options import (
+    HostedUserInteractionRequired,
+    consume_headless_clarification_response,
+    is_audio_enabled,
+    is_headless_mode,
+)
 from LLM_Tools.MCP_To_Tools import register_stats_dataset
 
 # ---------------------------------------------------------------------------
@@ -344,6 +350,64 @@ def filter_rows(
     # position to each output dict. .head(cap) keeps the index intact.
     result_df = df.head(cap)
     del df
+
+    if result_df.empty:
+        return json.dumps({"result": "No matching rows found for the given filters."})
+
+    return _rows_to_json(result_df, fields)
+
+
+@tool
+def get_recent_complaints(
+    filters: dict | None = None,
+    limit: int = 5,
+    fields: list | None = None,
+    date_field: str = "DATEA",
+) -> str:
+    """Return the newest complaint rows matching filters, sorted by one date column.
+
+    Use this when the user asks for the latest, newest, or most recent
+    complaints. Unlike filter_rows, this tool explicitly sorts by a complaint
+    date field before applying the row cap, so it can answer recency-based
+    requests deterministically instead of relying on parquet row order.
+    """
+    filters = filters or {}
+    cols_to_load = list(dict.fromkeys(list(filters.keys()) + ([date_field] if date_field else []) + (fields or [])))
+    df = pd.read_parquet(PARQUET_PATH, columns=cols_to_load or None)
+
+    if date_field not in df.columns:
+        del df
+        return json.dumps(
+            {
+                "error": (
+                    f"date_field {date_field!r} is not present in the complaint parquet file. "
+                    "Choose one of the available date columns from the schema summary."
+                )
+            },
+            indent=2,
+        )
+
+    filtered = _apply_filters(df, filters)
+    del df
+    if filtered.empty:
+        del filtered
+        return json.dumps({"result": "No matching rows found for the given filters."})
+
+    # DATEA and related complaint date columns are stored as strings in the
+    # cleaned parquet file. Parse them explicitly so "most recent" sorts by
+    # real chronology rather than lexicographic string order.
+    sortable = filtered.assign(
+        __parsed_sort_date=pd.to_datetime(filtered[date_field], errors="coerce")
+    )
+    cap = min(limit, MAX_ROWS)
+    result_df = (
+        sortable
+        .sort_values("__parsed_sort_date", ascending=False, na_position="last")
+        .head(cap)
+        .drop(columns=["__parsed_sort_date"])
+    )
+    del filtered
+    del sortable
 
     if result_df.empty:
         return json.dumps({"result": "No matching rows found for the given filters."})
@@ -890,6 +954,18 @@ def Ask_User(question: str) -> str:
     str
         Confirmation that the question was asked. Call User_Answer() next.
     """
+    # Hosted backend: there is a real human in the browser, but this Python
+    # process cannot ask them synchronously. Raise a structured pause signal so
+    # the FastAPI adapter can emit the question to the browser, collect the
+    # answer there, and resume later. Ask_User is the first half of the old
+    # two-tool contract, so on resume the model still needs to call
+    # User_Answer() to consume the stored reply.
+    if is_headless_mode():
+        raise HostedUserInteractionRequired(
+            question,
+            result_mode="confirm_then_answer",
+        )
+
     # In audio mode, speak the question aloud via TTS so the user hears it through
     # their speakers. In text mode, print the same question and let stdin carry
     # the follow-up response through User_Answer().
@@ -935,6 +1011,15 @@ def User_Answer() -> str:
     str
         The user's plain-text response.
     """
+    if is_headless_mode():
+        hosted_answer = consume_headless_clarification_response()
+        if hosted_answer is not None:
+            return hosted_answer
+        return (
+            "[User_Answer unavailable: the hosted clarification response was not "
+            "seeded before this tool call. Ask a new clarification question or "
+            "continue without the missing answer.]"
+        )
     # Capture the user's spoken reply in audio mode, or collect a typed reply in
     # text mode. Both branches return a plain-text string so the calling node
     # does not need mode-specific logic.
