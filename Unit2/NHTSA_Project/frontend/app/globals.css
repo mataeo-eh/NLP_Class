@@ -60,7 +60,7 @@ a {
 .hero-band,
 .dashboard-layout,
 .log-panel {
-  width: min(1180px, 100%);
+  width: min(1600px, 100%);
   margin-inline: auto;
 }
 
@@ -211,9 +211,18 @@ h2 {
 
 .dashboard-layout {
   display: grid;
-  grid-template-columns: minmax(250px, 330px) minmax(0, 1fr);
+  /* Three columns: status sidebar | main workspace | chart panel.
+     The chart panel column starts at 0px (hidden) and expands to 440px when
+     data-chart-open="true" is set by React.  The transition animates the
+     column width so the layout shift is gradual rather than jarring. */
+  grid-template-columns: minmax(250px, 330px) minmax(0, 1fr) 0px;
   gap: 20px;
   align-items: start;
+  transition: grid-template-columns 500ms ease;
+}
+
+.dashboard-layout[data-chart-open="true"] {
+  grid-template-columns: minmax(250px, 330px) minmax(0, 1fr) 440px;
 }
 
 .side-panel,
@@ -596,13 +605,107 @@ h2 {
   margin-top: 14px;
 }
 
+/* ---------------------------------------------------------------------------
+   Chart panel
+   --------------------------------------------------------------------------- */
+
+.chart-panel {
+  /* Overflow hidden keeps content invisible while the column is collapsing.
+     Once the column has width the content fades in via opacity transition. */
+  overflow: hidden;
+  border: 1px solid rgba(16, 24, 32, 0.14);
+  border-radius: var(--radius);
+  background: rgba(255, 255, 255, 0.88);
+  box-shadow: 0 16px 42px rgba(16, 24, 32, 0.08);
+  position: sticky;
+  top: 18px;
+  /* Fade the inner content in/out slightly behind the column-width animation
+     so text doesn't awkwardly overflow the 0px column on collapse. */
+  opacity: 0;
+  transition: opacity 400ms ease 80ms;
+  pointer-events: none;
+}
+
+.dashboard-layout[data-chart-open="true"] .chart-panel {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.chart-viewer {
+  padding: 20px;
+}
+
+.chart-viewer-header {
+  margin-bottom: 14px;
+}
+
+.chart-tab-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.chart-tab {
+  padding: 5px 12px;
+  border: 1px solid rgba(16, 24, 32, 0.18);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--muted-ink);
+  font-size: 0.78rem;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+
+.chart-tab:hover {
+  border-color: var(--green);
+  color: var(--green);
+}
+
+.chart-tab-active {
+  border-color: var(--green);
+  background: var(--green);
+  color: #fff;
+}
+
+.chart-viewport {
+  overflow-x: auto;
+}
+
+.chart-empty {
+  margin: 0;
+  padding: 24px 0;
+  color: var(--muted-ink);
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+.chart-make-label {
+  margin: 0 0 10px;
+  color: var(--navy);
+  font-size: 0.9rem;
+  font-weight: 800;
+}
+
+.chart-make-label span {
+  font-weight: 400;
+  color: var(--muted-ink);
+}
+
 @media (max-width: 900px) {
   .page-shell {
     padding: 18px;
   }
 
-  .hero-band,
-  .dashboard-layout {
+  .hero-band {
+    grid-template-columns: 1fr;
+  }
+
+  /* On narrow screens all three dashboard columns stack vertically.
+     The chart panel is always full-width when it appears. */
+  .dashboard-layout,
+  .dashboard-layout[data-chart-open="true"] {
     grid-template-columns: 1fr;
   }
 
@@ -610,8 +713,14 @@ h2 {
     min-height: 86px;
   }
 
-  .side-panel {
+  .side-panel,
+  .chart-panel {
     position: static;
+  }
+
+  .dashboard-layout .chart-panel {
+    opacity: 1;
+    pointer-events: auto;
   }
 }
 

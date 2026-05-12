@@ -8,6 +8,16 @@
 //   3. stream per-node narration audio plus the final answer
 
 import { useEffect, useRef, useState } from "react";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 
 const configuredBackendBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL;
 const backendBaseUrl = configuredBackendBaseUrl ?? "";
@@ -64,6 +74,231 @@ type WindowWithWebkitAudioContext = Window &
   typeof globalThis & {
     webkitAudioContext?: typeof AudioContext;
   };
+
+// ---------------------------------------------------------------------------
+// Chart panel types and component
+// ---------------------------------------------------------------------------
+
+type ChartData = {
+  chart_name: string;
+  summary: Record<string, unknown>;
+};
+
+const CHART_LABELS: Record<string, string> = {
+  create_bar_chart:                        "LLM Subsystem Labels",
+  create_model_year_chart:                 "Top Vehicles by Complaints",
+  create_human_subsystem_frequency_chart:  "Component Frequency",
+  compare_LLM_to_NHTSA:                   "LLM vs NHTSA Agreement",
+  create_subsystem_frequency_by_make_chart:"Components by Make",
+  create_subsystem_safety_signal_chart:    "Safety Signals by Subsystem",
+  create_model_year_trend_chart:           "Complaints by Model Year",
+};
+
+const CHART_COLORS = ["#0f6b52", "#275c7d", "#c67a16", "#b5333f", "#172b3a"];
+
+function ChartViewer({
+  charts,
+  index,
+  onIndexChange,
+}: {
+  charts: ChartData[];
+  index: number;
+  onIndexChange: (i: number) => void;
+}) {
+  const active = charts[index];
+  if (!active) return null;
+
+  const { chart_name, summary } = active;
+  const label = CHART_LABELS[chart_name] ?? chart_name;
+
+  function renderChart() {
+    // ---- create_bar_chart ------------------------------------------------
+    if (chart_name === "create_bar_chart") {
+      const valueCounts = (summary.value_counts ?? {}) as Record<string, Record<string, number>>;
+      const colName = Object.keys(valueCounts)[0] ?? "";
+      const counts = valueCounts[colName] ?? {};
+      const data = Object.entries(counts)
+        .map(([name, value]) => ({ name, value }))
+        .sort((a, b) => b.value - a.value);
+      return (
+        <ResponsiveContainer width="100%" height={Math.max(200, data.length * 28)}>
+          <BarChart data={data} layout="vertical" margin={{ left: 8, right: 24, top: 4, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(16,24,32,0.08)" />
+            <XAxis type="number" tick={{ fontSize: 11 }} />
+            <YAxis type="category" dataKey="name" width={140} tick={{ fontSize: 10 }} />
+            <Tooltip formatter={(v) => [typeof v === "number" ? v.toLocaleString() : String(v ?? ""), "Count"]} />
+            <Bar dataKey="value" radius={[0, 3, 3, 0]}>
+              {data.map((_, i) => <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    // ---- create_model_year_chart -----------------------------------------
+    if (chart_name === "create_model_year_chart") {
+      const raw = (summary.top_5_make_model ?? []) as { vehicle: string; count: number }[];
+      const data = [...raw].reverse();
+      return (
+        <ResponsiveContainer width="100%" height={Math.max(200, data.length * 40)}>
+          <BarChart data={data} layout="vertical" margin={{ left: 8, right: 24, top: 4, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(16,24,32,0.08)" />
+            <XAxis type="number" tick={{ fontSize: 11 }} tickFormatter={(v) => typeof v === "number" ? v.toLocaleString() : String(v)} />
+            <YAxis type="category" dataKey="vehicle" width={160} tick={{ fontSize: 9 }} />
+            <Tooltip formatter={(v) => [typeof v === "number" ? v.toLocaleString() : String(v ?? ""), "Complaints"]} />
+            <Bar dataKey="count" fill="#0f6b52" radius={[0, 3, 3, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    // ---- create_human_subsystem_frequency_chart --------------------------
+    if (chart_name === "create_human_subsystem_frequency_chart") {
+      const raw = (summary.component_counts ?? []) as { component: string; count: number }[];
+      const data = raw.map(d => ({ name: d.component, value: d.count })).reverse();
+      return (
+        <ResponsiveContainer width="100%" height={Math.max(200, data.length * 26)}>
+          <BarChart data={data} layout="vertical" margin={{ left: 8, right: 24, top: 4, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(16,24,32,0.08)" />
+            <XAxis type="number" tick={{ fontSize: 11 }} tickFormatter={(v) => typeof v === "number" ? v.toLocaleString() : String(v)} />
+            <YAxis type="category" dataKey="name" width={160} tick={{ fontSize: 9 }} />
+            <Tooltip formatter={(v) => [typeof v === "number" ? v.toLocaleString() : String(v ?? ""), "Complaints"]} />
+            <Bar dataKey="value" fill="#275c7d" radius={[0, 3, 3, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    // ---- compare_LLM_to_NHTSA -------------------------------------------
+    if (chart_name === "compare_LLM_to_NHTSA") {
+      const ac = (summary.agreement_counts ?? { full: 0, partial: 0, none: 0 }) as {
+        full: number; partial: number; none: number;
+      };
+      const pct = (summary.percentages ?? { full: 0, partial: 0, none: 0 }) as {
+        full: number; partial: number; none: number;
+      };
+      const data = [
+        { name: "Full", value: ac.full, pct: pct.full },
+        { name: "Partial", value: ac.partial, pct: pct.partial },
+        { name: "None", value: ac.none, pct: pct.none },
+      ];
+      const colors = ["#0f6b52", "#c67a16", "#b5333f"];
+      return (
+        <ResponsiveContainer width="100%" height={200}>
+          <BarChart data={data} margin={{ left: 8, right: 24, top: 4, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(16,24,32,0.08)" />
+            <XAxis dataKey="name" tick={{ fontSize: 12 }} />
+            <YAxis tick={{ fontSize: 11 }} />
+            <Tooltip formatter={(v, _name, item) => {
+              const num = typeof v === "number" ? v : 0;
+              const pct = typeof item?.payload?.pct === "number" ? item.payload.pct : 0;
+              return [`${num} (${pct.toFixed(1)}%)`, "Complaints"];
+            }} />
+            <Bar dataKey="value" radius={[3, 3, 0, 0]}>
+              {data.map((_, i) => <Cell key={i} fill={colors[i]} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    // ---- create_subsystem_frequency_by_make_chart -----------------------
+    if (chart_name === "create_subsystem_frequency_by_make_chart") {
+      type MakePlotted = { make: string; complaint_count: number; top_components: { component: string; count: number }[] };
+      const makes = (summary.makes_plotted ?? []) as MakePlotted[];
+      if (makes.length === 0) return <p className="chart-empty">No make data available.</p>;
+      // Show first make; tabs handled by the index nav above
+      const make = makes[0];
+      const data = make.top_components.map(c => ({ name: c.component, value: c.count })).reverse();
+      return (
+        <>
+          <p className="chart-make-label">{make.make} <span>({make.complaint_count.toLocaleString()} complaints)</span></p>
+          <ResponsiveContainer width="100%" height={Math.max(180, data.length * 26)}>
+            <BarChart data={data} layout="vertical" margin={{ left: 8, right: 24, top: 4, bottom: 4 }}>
+              <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(16,24,32,0.08)" />
+              <XAxis type="number" tick={{ fontSize: 11 }} />
+              <YAxis type="category" dataKey="name" width={150} tick={{ fontSize: 9 }} />
+              <Tooltip formatter={(v) => [typeof v === "number" ? v.toLocaleString() : String(v ?? ""), "Complaints"]} />
+              <Bar dataKey="value" fill="#172b3a" radius={[0, 3, 3, 0]} />
+            </BarChart>
+          </ResponsiveContainer>
+        </>
+      );
+    }
+
+    // ---- create_subsystem_safety_signal_chart ---------------------------
+    if (chart_name === "create_subsystem_safety_signal_chart") {
+      type CompRow = { component: string; complaints: number; crash_rate_pct: number; fire_rate_pct: number };
+      const raw = (summary.components ?? []) as CompRow[];
+      const data = raw.map(c => ({ name: c.component, complaints: c.complaints, crash: c.crash_rate_pct, fire: c.fire_rate_pct })).reverse();
+      return (
+        <ResponsiveContainer width="100%" height={Math.max(200, data.length * 26)}>
+          <BarChart data={data} layout="vertical" margin={{ left: 8, right: 24, top: 4, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="rgba(16,24,32,0.08)" />
+            <XAxis type="number" tick={{ fontSize: 11 }} tickFormatter={(v) => typeof v === "number" ? v.toLocaleString() : String(v)} />
+            <YAxis type="category" dataKey="name" width={155} tick={{ fontSize: 9 }} />
+            <Tooltip formatter={(v, name) => {
+              const num = typeof v === "number" ? v : 0;
+              const n = String(name);
+              return [
+                n === "complaints" ? num.toLocaleString() : `${num.toFixed(1)}%`,
+                n === "complaints" ? "Complaints" : n === "crash" ? "Crash rate" : "Fire rate",
+              ];
+            }} />
+            <Bar dataKey="complaints" fill="#275c7d" radius={[0, 3, 3, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    // ---- create_model_year_trend_chart ----------------------------------
+    if (chart_name === "create_model_year_trend_chart") {
+      const raw = (summary.top_5_years ?? []) as { year: number; count: number }[];
+      const data = raw.map(y => ({ name: String(y.year), value: y.count }));
+      return (
+        <ResponsiveContainer width="100%" height={220}>
+          <BarChart data={data} margin={{ left: 8, right: 24, top: 4, bottom: 4 }}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(16,24,32,0.08)" />
+            <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+            <YAxis tick={{ fontSize: 11 }} tickFormatter={(v) => typeof v === "number" ? v.toLocaleString() : String(v)} />
+            <Tooltip formatter={(v) => [typeof v === "number" ? v.toLocaleString() : String(v ?? ""), "Complaints"]} />
+            <Bar dataKey="value" fill="#0f6b52" radius={[3, 3, 0, 0]}>
+              {data.map((_, i) => <Cell key={i} fill={CHART_COLORS[i % CHART_COLORS.length]} />)}
+            </Bar>
+          </BarChart>
+        </ResponsiveContainer>
+      );
+    }
+
+    return <p className="chart-empty">No renderer for chart type: {chart_name}</p>;
+  }
+
+  return (
+    <div className="chart-viewer">
+      <div className="chart-viewer-header">
+        <p className="section-kicker">Chart output</p>
+        <h2>{label}</h2>
+        {charts.length > 1 && (
+          <div className="chart-tab-row">
+            {charts.map((c, i) => (
+              <button
+                key={c.chart_name}
+                type="button"
+                className={`chart-tab${i === index ? " chart-tab-active" : ""}`}
+                onClick={() => onIndexChange(i)}
+              >
+                {CHART_LABELS[c.chart_name] ?? c.chart_name}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <div className="chart-viewport">
+        {renderChart()}
+      </div>
+    </div>
+  );
+}
 
 const fallbackVoicePreviewText =
   "Hello, how are you doing on this fine day. " +
@@ -315,6 +550,8 @@ export default function HomePage() {
   const [log, setLog] = useState("");
   const [finalResponse, setFinalResponse] = useState("");
   const [audioUrl, setAudioUrl] = useState("");
+  const [activeCharts, setActiveCharts] = useState<ChartData[]>([]);
+  const [chartPanelIndex, setChartPanelIndex] = useState(0);
 
   const abortRef = useRef<AbortController | null>(null);
   const speechAbortRef = useRef<AbortController | null>(null);
@@ -704,6 +941,26 @@ export default function HomePage() {
       return typeof payload.task_type === "string" ? payload.task_type.trim() : "";
     } catch {
       return "";
+    }
+  }
+
+  // Parse the `charts` field from a `completed` SSE event payload.
+  // The backend sends charts as a dict keyed by chart_name, where each value is
+  // the structured summary dict computed by the @tool wrapper.  We convert that
+  // into a flat array so ChartViewer can iterate over it with a simple index.
+  function extractCharts(eventData: string): ChartData[] {
+    try {
+      const payload = JSON.parse(eventData) as { charts?: unknown };
+      const charts = payload.charts;
+      if (!charts || typeof charts !== "object" || Array.isArray(charts)) return [];
+      return Object.entries(charts as Record<string, unknown>)
+        .filter(([, v]) => v !== null && typeof v === "object")
+        .map(([name, summary]) => ({
+          chart_name: name,
+          summary: summary as Record<string, unknown>,
+        }));
+    } catch {
+      return [];
     }
   }
 
@@ -1278,6 +1535,12 @@ export default function HomePage() {
               taskType === "agentic_retrieve_and_analyze";
             setCanContinueSession(resumableAgenticConversation);
             setFinalResponse(responseText);
+            // Surface any charts the pipeline produced during this run.
+            const newCharts = extractCharts(ev.data);
+            if (newCharts.length > 0) {
+              setActiveCharts(newCharts);
+              setChartPanelIndex(0);
+            }
             if (responseText) {
               appendChatTurn({ role: "assistant", text: responseText });
               queueSpeechText(responseText);
@@ -1368,7 +1631,10 @@ export default function HomePage() {
         </div>
       </section>
 
-      <section className="dashboard-layout">
+      <section
+        className="dashboard-layout"
+        data-chart-open={activeCharts.length > 0 ? "true" : "false"}
+      >
         <aside className="side-panel" aria-label="Session status">
           <div className="status-box" data-state={statusState}>
             <p className="status-label">{currentPhase}</p>
@@ -1687,6 +1953,15 @@ export default function HomePage() {
             />
           ) : null}
         </section>
+
+        {/* Chart panel — collapsed by default, expands via CSS when activeCharts.length > 0 */}
+        <aside className="chart-panel" aria-label="Chart viewer">
+          <ChartViewer
+            charts={activeCharts}
+            index={chartPanelIndex}
+            onIndexChange={setChartPanelIndex}
+          />
+        </aside>
       </section>
 
       <section className="log-panel" aria-label="Backend event stream">
