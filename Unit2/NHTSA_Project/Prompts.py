@@ -897,16 +897,17 @@ HOW MANY RESULTS?
   - If the request is clearly a single-record lookup (e.g. "what is the complaint
     for row 4587", "show me that entry"), fetch 1 result.
   - If the request is ambiguous and could mean multiple results (e.g. "show me
-    some brake complaints", "give me examples"), use Ask_User to ask how many
-    they want, then call User_Answer() to receive their response before fetching.
+    some brake complaints", "give me examples"), call voice_ask_user with a
+    clarifying question. The tool speaks the question, captures the reply, and
+    returns the transcript — use that answer to decide how many rows to fetch.
 
 WHICH FIELDS?
   - If the user names a specific field (e.g. "what was the complaint text",
     "show me the make and model"), return only those fields.
   - If the user asks to "show me the entry", "show me the record", or uses
     similarly broad language, return all non-NaN fields for each row.
-  - If it is genuinely unclear which fields the user wants, use Ask_User to
-    ask, then call User_Answer() before fetching.
+  - If it is genuinely unclear which fields the user wants, call voice_ask_user
+    to ask before fetching.
 
 WHEN TO ASK VS. WHEN TO INFER
   Ask when: getting it wrong would return something useless (e.g. 1 result
@@ -981,9 +982,10 @@ DEMO_PROMPTS: list[dict] = [
             "injury count. Exercises the classify_task → retrieve_data → END path."
         ),
         "prompt_text": (
-            "Show me 5 recent NHTSA complaints about brake failures. "
-            "For each one, return the complaint ID, make, model, model year, "
-            "number of injuries, and the full complaint description text."
+            "Return the 5 most recent brake failure complaints from the database. "
+            "For each record, include the complaint ID, make, model, model year, injury count, "
+            "and the full complaint description text. "
+            "No analysis, scoring, or interpretation needed — just return the raw records."
         ),
         "is_followup": False,
         "followup_for": None,
@@ -1008,10 +1010,11 @@ DEMO_PROMPTS: list[dict] = [
             "Exercises the classify_task → retrieve_data → analyze → confirm_csv_write path."
         ),
         "prompt_text": (
-            "Retrieve 3 recent airbag malfunction complaints and perform a safety "
-            "evaluation on each one. For each complaint, assess the danger level "
-            "(None / Low / Mild / Moderate / High / Severe), urgency for human review "
-            "(Low / Urgent / Emergent), assign a safety category, and provide thorough reasoning."
+            "Evaluate the 3 most recent airbag malfunction complaints for safety risk. "
+            "For each complaint, assign a danger level (None / Low / Mild / Moderate / High / Severe), "
+            "an urgency rating for human review (Low / Urgent / Emergent), a safety category, "
+            "and detailed reasoning that explains the assessment. "
+            "Apply the same structured safety evaluation to each of the 3 complaints."
         ),
         "is_followup": False,
         "followup_for": None,
@@ -1036,10 +1039,12 @@ DEMO_PROMPTS: list[dict] = [
             "Exercises classify_task → classify_agentic_subtype → agentic_analyze."
         ),
         "prompt_text": (
-            "Retrieve the 5 most recent Toyota brake-related complaints from 2022 onwards. "
-            "For each complaint, pull the injury count and death count from the database as "
-            "supporting evidence, then rate the danger level (Low / Moderate / High / Severe) "
-            "with a specific justification grounded in both the complaint text and the injury data."
+            "Investigate the 5 most recent Toyota brake-related complaints from 2022 onward. "
+            "For each complaint you retrieve, look up its injury count and death count from "
+            "the database as supporting evidence. Then, using both the complaint text and the "
+            "casualty data you pulled, produce a structured danger assessment for each complaint: "
+            "rate it Low / Moderate / High / Severe and explain the specific evidence — from the "
+            "complaint text and the injury and death figures — that justifies each rating."
         ),
         "is_followup": False,
         "followup_for": None,
@@ -1064,11 +1069,11 @@ DEMO_PROMPTS: list[dict] = [
             "warrants changing. Demonstrates agentic back-and-forth reasoning."
         ),
         "prompt_text": (
-            "Now compare those Toyota brake complaint danger ratings against the broader "
-            "picture: how many Toyota brake complaints exist in the full database, and "
-            "what is the average injury count across all of them? If the population-level "
-            "data suggests these complaints are unusually severe or unusually mild relative "
-            "to the norm, revise your danger ratings and explain exactly what changed and why."
+            "Now retrieve the full population of Toyota brake complaints in the database "
+            "and calculate the average injury count across all of them. Compare that population "
+            "baseline against the 5 complaints you already assessed — do the broader numbers "
+            "suggest any of your danger ratings are too high or too low? Revise any ratings "
+            "the population data warrants changing and explain exactly what shifted and why."
         ),
         "is_followup": True,
         "followup_for": "agentic_analyze_toyota_brakes",
@@ -1093,10 +1098,11 @@ DEMO_PROMPTS: list[dict] = [
             "→ agentic_explore with chart generation and spoken narration."
         ),
         "prompt_text": (
-            "Show me a bar chart of the top 10 vehicle makes with the most NHTSA "
-            "complaints in the database. After rendering the chart, narrate what you "
-            "see: which make has the most complaints, how large is the gap between "
-            "first and second place, and are there any surprising entries in the top 10?"
+            "Let's explore the NHTSA complaint database by vehicle make. Generate a bar chart "
+            "of the top 10 vehicle makes by total complaint count. Once the chart is rendered, "
+            "walk me through what you see: which make leads, how large is the gap between first "
+            "and second, and whether anything in the top 10 is surprising. "
+            "I may want to drill deeper from there."
         ),
         "is_followup": False,
         "followup_for": None,
@@ -1121,10 +1127,10 @@ DEMO_PROMPTS: list[dict] = [
             "multi-turn conversational data exploration."
         ),
         "prompt_text": (
-            "Now zoom into the vehicle make with the most complaints from that chart. "
-            "Break down its complaints by subsystem component — which vehicle systems "
-            "are failing most often for that brand? Show me a subsystem frequency bar "
-            "chart and walk me through the top 5 failure categories."
+            "Let's keep exploring. Zoom into the make with the most complaints and break down "
+            "its complaints by vehicle component or subsystem. Generate a chart showing which "
+            "systems fail most often for that brand, then walk me through the top 5 failure "
+            "categories and what they tell us about that make's reliability profile."
         ),
         "is_followup": True,
         "followup_for": "agentic_explore_top_makes_chart",
