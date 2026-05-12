@@ -545,6 +545,57 @@ h2 {
   word-break: break-word;
 }
 
+.voice-settings-panel {
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius);
+  background: rgba(10, 16, 25, 0.55);
+}
+
+.button-inline {
+  width: auto;
+}
+
+.tts-grid {
+  display: grid;
+  gap: 14px;
+  margin-top: 14px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.tts-control {
+  display: grid;
+  gap: 8px;
+  color: rgba(234, 241, 237, 0.86);
+  font-size: 0.88rem;
+}
+
+.tts-select {
+  width: 100%;
+  padding: 12px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 16px;
+  background: rgba(13, 20, 31, 0.88);
+  color: #f5f7f4;
+  font: inherit;
+}
+
+.tts-helper {
+  margin: 14px 0 0;
+  color: rgba(220, 229, 224, 0.72);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.request-input-compact {
+  min-height: 108px;
+}
+
+.action-row-compact {
+  margin-top: 14px;
+}
+
 @media (max-width: 900px) {
   .page-shell {
     padding: 18px;
@@ -591,6 +642,10 @@ h2 {
 
   .hero-copy {
     font-size: 1.55rem;
+  }
+
+  .tts-grid {
+    grid-template-columns: 1fr;
   }
 
   .conversation-turn {

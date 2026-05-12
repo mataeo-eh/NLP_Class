@@ -7,7 +7,7 @@
 //   2. accept either typed input or push-to-talk audio upload
 //   3. stream per-node narration audio plus the final answer
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const configuredBackendBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL;
 const backendBaseUrl = configuredBackendBaseUrl ?? "";
@@ -27,10 +27,36 @@ type WarmupResponse = {
   ready_prompt?: unknown;
 };
 
+type TtsVoiceOption = {
+  id: string;
+  label: string;
+  description: string;
+};
+
+type TtsProviderOption = {
+  id: string;
+  label: string;
+  description: string;
+  supports_streaming: boolean;
+  default_voice_preset: string;
+  voices: TtsVoiceOption[];
+};
+
+type TtsOptionsResponse = {
+  default_tts_provider: string;
+  default_voice_preset: string;
+  default_preview_text: string;
+  providers: TtsProviderOption[];
+};
+
 type WindowWithWebkitAudioContext = Window &
   typeof globalThis & {
     webkitAudioContext?: typeof AudioContext;
   };
+
+const fallbackVoicePreviewText =
+  "Hello, how are you doing on this fine day. " +
+  "Were you able to find everything you were looking for?";
 
 function createConversationId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -42,34 +68,76 @@ function createConversationId(): string {
 function pcmChunkToAudioBuffer(
   audioContext: AudioContext,
   pcmBytes: Uint8Array,
+  codec: string,
   sampleRate: number,
 ): AudioBuffer {
-  const sampleCount = pcmBytes.byteLength / 2;
-  const channelData = new Float32Array(sampleCount);
-  const view = new DataView(
-    pcmBytes.buffer,
-    pcmBytes.byteOffset,
-    pcmBytes.byteLength,
-  );
-
-  for (let index = 0; index < sampleCount; index += 1) {
-    const pcmValue = view.getInt16(index * 2, true);
-    channelData[index] = pcmValue / 32768;
+  if (codec === "pcm_f32le") {
+    const alignedBuffer = new ArrayBuffer(pcmBytes.byteLength);
+    new Uint8Array(alignedBuffer).set(pcmBytes);
+    const floatSamples = new Float32Array(alignedBuffer);
+    const audioBuffer = audioContext.createBuffer(1, floatSamples.length, sampleRate);
+    audioBuffer.copyToChannel(floatSamples, 0, 0);
+    return audioBuffer;
   }
 
-  const audioBuffer = audioContext.createBuffer(1, sampleCount, sampleRate);
-  audioBuffer.copyToChannel(channelData, 0, 0);
-  return audioBuffer;
+  if (codec === "linear16") {
+    const sampleCount = pcmBytes.byteLength / 2;
+    const channelData = new Float32Array(sampleCount);
+    const view = new DataView(
+      pcmBytes.buffer,
+      pcmBytes.byteOffset,
+      pcmBytes.byteLength,
+    );
+
+    for (let index = 0; index < sampleCount; index += 1) {
+      const pcmValue = view.getInt16(index * 2, true);
+      channelData[index] = pcmValue / 32768;
+    }
+
+    const audioBuffer = audioContext.createBuffer(1, sampleCount, sampleRate);
+    audioBuffer.copyToChannel(channelData, 0, 0);
+    return audioBuffer;
+  }
+
+  if (codec === "pcm16") {
+    const sampleCount = pcmBytes.byteLength / 2;
+    const channelData = new Float32Array(sampleCount);
+    const view = new DataView(
+      pcmBytes.buffer,
+      pcmBytes.byteOffset,
+      pcmBytes.byteLength,
+    );
+
+    for (let index = 0; index < sampleCount; index += 1) {
+      const pcmValue = view.getInt16(index * 2, true);
+      channelData[index] = pcmValue / 32768;
+    }
+
+    const audioBuffer = audioContext.createBuffer(1, sampleCount, sampleRate);
+    audioBuffer.copyToChannel(channelData, 0, 0);
+    return audioBuffer;
+  }
+
+  throw new Error(`Unsupported streamed audio codec: ${codec}`);
 }
 
 function buildWaveBlobFromPcmChunks(
   pcmChunks: Uint8Array[],
+  codec: string,
   sampleRate: number,
 ): Blob {
   const pcmByteLength = pcmChunks.reduce(
     (total, chunk) => total + chunk.byteLength,
     0,
   );
+  const bytesPerSample = bytesPerSampleForCodec(codec);
+  if (!bytesPerSample) {
+    throw new Error(`Unsupported streamed audio codec: ${codec}`);
+  }
+  const bitsPerSample = bytesPerSample * 8;
+  const blockAlign = bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const wavFormatTag = codec === "pcm_f32le" ? 3 : 1;
   const wavBuffer = new ArrayBuffer(44 + pcmByteLength);
   const view = new DataView(wavBuffer);
   let offset = 0;
@@ -88,17 +156,17 @@ function buildWaveBlobFromPcmChunks(
   writeAscii("fmt ");
   view.setUint32(offset, 16, true);
   offset += 4;
-  view.setUint16(offset, 1, true);
+  view.setUint16(offset, wavFormatTag, true);
   offset += 2;
   view.setUint16(offset, 1, true);
   offset += 2;
   view.setUint32(offset, sampleRate, true);
   offset += 4;
-  view.setUint32(offset, sampleRate * 2, true);
+  view.setUint32(offset, byteRate, true);
   offset += 4;
-  view.setUint16(offset, 2, true);
+  view.setUint16(offset, blockAlign, true);
   offset += 2;
-  view.setUint16(offset, 16, true);
+  view.setUint16(offset, bitsPerSample, true);
   offset += 2;
   writeAscii("data");
   view.setUint32(offset, pcmByteLength, true);
@@ -123,11 +191,105 @@ function guessAudioFilename(mimeType: string): string {
   return "speech.webm";
 }
 
+function bytesPerSampleForCodec(codec: string): number | null {
+  if (codec === "linear16") {
+    return 2;
+  }
+  if (codec === "pcm16") {
+    return 2;
+  }
+  if (codec === "pcm_f32le") {
+    return 4;
+  }
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function parseTtsOptionsResponse(payload: unknown): TtsOptionsResponse | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  const defaultProvider = payload.default_tts_provider;
+  const defaultVoicePreset = payload.default_voice_preset;
+  const defaultPreviewText = payload.default_preview_text;
+  const rawProviders = payload.providers;
+
+  if (
+    typeof defaultProvider !== "string" ||
+    typeof defaultVoicePreset !== "string" ||
+    typeof defaultPreviewText !== "string" ||
+    !Array.isArray(rawProviders)
+  ) {
+    return null;
+  }
+
+  const providers: TtsProviderOption[] = [];
+  for (const rawProvider of rawProviders) {
+    if (!isRecord(rawProvider) || !Array.isArray(rawProvider.voices)) {
+      return null;
+    }
+    if (
+      typeof rawProvider.id !== "string" ||
+      typeof rawProvider.label !== "string" ||
+      typeof rawProvider.description !== "string" ||
+      typeof rawProvider.supports_streaming !== "boolean" ||
+      typeof rawProvider.default_voice_preset !== "string"
+    ) {
+      return null;
+    }
+
+    const voices: TtsVoiceOption[] = [];
+    for (const rawVoice of rawProvider.voices) {
+      if (
+        !isRecord(rawVoice) ||
+        typeof rawVoice.id !== "string" ||
+        typeof rawVoice.label !== "string" ||
+        typeof rawVoice.description !== "string"
+      ) {
+        return null;
+      }
+      voices.push({
+        id: rawVoice.id,
+        label: rawVoice.label,
+        description: rawVoice.description,
+      });
+    }
+
+    providers.push({
+      id: rawProvider.id,
+      label: rawProvider.label,
+      description: rawProvider.description,
+      supports_streaming: rawProvider.supports_streaming,
+      default_voice_preset: rawProvider.default_voice_preset,
+      voices,
+    });
+  }
+
+  return {
+    default_tts_provider: defaultProvider,
+    default_voice_preset: defaultVoicePreset,
+    default_preview_text: defaultPreviewText,
+    providers,
+  };
+}
+
 export default function HomePage() {
   const [request, setRequest] = useState("");
   const [conversationId, setConversationId] = useState(() => createConversationId());
   const [canContinueSession, setCanContinueSession] = useState(false);
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
+  const [voiceSettingsOpen, setVoiceSettingsOpen] = useState(false);
+  const [ttsOptionsLoading, setTtsOptionsLoading] = useState(false);
+  const [ttsProviders, setTtsProviders] = useState<TtsProviderOption[]>([]);
+  const [selectedTtsProvider, setSelectedTtsProvider] = useState("deepgram");
+  const [selectedVoicePreset, setSelectedVoicePreset] = useState(
+    "aura-2-hyperion-en",
+  );
+  const [voicePreviewText, setVoicePreviewText] = useState(fallbackVoicePreviewText);
   const [warmingUp, setWarmingUp] = useState(false);
   const [warmedUp, setWarmedUp] = useState(false);
   const [running, setRunning] = useState(false);
@@ -153,6 +315,10 @@ export default function HomePage() {
   const recordedChunksRef = useRef<Blob[]>([]);
   const speechQueueRef = useRef<string[]>([]);
   const drainingSpeechQueueRef = useRef(false);
+  const ttsSelectionRef = useRef({
+    ttsProvider: "deepgram",
+    voicePreset: "aura-2-hyperion-en",
+  });
 
   function appendLog(line: string) {
     const cleanedLine = line.trim();
@@ -165,6 +331,106 @@ export default function HomePage() {
     if (!cleanedText) return;
     setChatTurns((prev) => [...prev, { role: turn.role, text: cleanedText }]);
   }
+
+  function findProviderOption(providerId: string): TtsProviderOption | null {
+    return ttsProviders.find((provider) => provider.id === providerId) ?? null;
+  }
+
+  function applyTtsSelection(providerId: string, voicePreset: string) {
+    ttsSelectionRef.current = {
+      ttsProvider: providerId,
+      voicePreset,
+    };
+    setSelectedTtsProvider(providerId);
+    setSelectedVoicePreset(voicePreset);
+  }
+
+  function buildSpeechRequestBody(
+    text: string,
+    selection?: { ttsProvider: string; voicePreset: string },
+  ) {
+    const activeSelection = selection ?? ttsSelectionRef.current;
+    return {
+      text,
+      tts_provider: activeSelection.ttsProvider,
+      voice_preset: activeSelection.voicePreset,
+    };
+  }
+
+  useEffect(() => {
+    if (!backendBaseUrl) {
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadTtsOptions() {
+      setTtsOptionsLoading(true);
+      try {
+        const response = await fetch(`${backendBaseUrl}/audio/tts/options`, {
+          method: "GET",
+        });
+        if (!response.ok) {
+          const detail = await response.text();
+          appendLog(`tts options HTTP ${response.status} - ${detail}`);
+          return;
+        }
+
+        const payload = parseTtsOptionsResponse(await response.json());
+        if (!payload) {
+          appendLog("tts options failed validation on the frontend");
+          return;
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        setTtsProviders(payload.providers);
+        setVoicePreviewText(payload.default_preview_text || fallbackVoicePreviewText);
+
+        const preferredProvider =
+          payload.providers.find(
+            (provider) => provider.id === payload.default_tts_provider,
+          ) ?? payload.providers[0];
+        if (!preferredProvider) {
+          appendLog("tts options response did not include any providers");
+          return;
+        }
+
+        const preferredVoice =
+          preferredProvider.voices.find(
+            (voice) => voice.id === payload.default_voice_preset,
+          )?.id ??
+          preferredProvider.default_voice_preset ??
+          preferredProvider.voices[0]?.id;
+        if (!preferredVoice) {
+          appendLog(
+            `tts provider ${preferredProvider.id} did not include any selectable voices`,
+          );
+          return;
+        }
+
+        applyTtsSelection(preferredProvider.id, preferredVoice);
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+        const message = err instanceof Error ? err.message : String(err);
+        appendLog(`tts options failed: ${message}`);
+      } finally {
+        if (!cancelled) {
+          setTtsOptionsLoading(false);
+        }
+      }
+    }
+
+    void loadTtsOptions();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   function tryParseJson(rawText: string): unknown | null {
     try {
@@ -320,9 +586,15 @@ export default function HomePage() {
   function schedulePcmChunk(
     audioContext: AudioContext,
     pcmBytes: Uint8Array,
+    codec: string,
     sampleRate: number,
   ) {
-    const audioBuffer = pcmChunkToAudioBuffer(audioContext, pcmBytes, sampleRate);
+    const audioBuffer = pcmChunkToAudioBuffer(
+      audioContext,
+      pcmBytes,
+      codec,
+      sampleRate,
+    );
     const source = audioContext.createBufferSource();
     source.buffer = audioBuffer;
     source.connect(audioContext.destination);
@@ -407,12 +679,16 @@ export default function HomePage() {
     const spokenText = text.trim();
     if (!backendBaseUrl || !spokenText) return;
 
+    const activeSelection = { ...ttsSelectionRef.current };
+    appendLog(
+      `POST ${backendBaseUrl}/audio/speech (${activeSelection.ttsProvider}:${activeSelection.voicePreset})`,
+    );
     setSpeaking(true);
     try {
       const response = await fetch(`${backendBaseUrl}/audio/speech`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: spokenText }),
+        body: JSON.stringify(buildSpeechRequestBody(spokenText, activeSelection)),
       });
 
       if (!response.ok) {
@@ -449,6 +725,13 @@ export default function HomePage() {
     const spokenText = text.trim();
     if (!backendBaseUrl || !spokenText) return;
 
+    const activeSelection = { ...ttsSelectionRef.current };
+    const providerOption = findProviderOption(activeSelection.ttsProvider);
+    if (!providerOption?.supports_streaming) {
+      await speakBufferedText(spokenText);
+      return;
+    }
+
     const audioContext = await ensureAudioContextReady();
     if (!audioContext) {
       appendLog(
@@ -473,10 +756,13 @@ export default function HomePage() {
     setSpeaking(true);
 
     try {
+      appendLog(
+        `POST ${backendBaseUrl}/audio/speech/stream (${activeSelection.ttsProvider}:${activeSelection.voicePreset})`,
+      );
       const response = await fetch(`${backendBaseUrl}/audio/speech/stream`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text: spokenText }),
+        body: JSON.stringify(buildSpeechRequestBody(spokenText, activeSelection)),
         signal: controller.signal,
       });
 
@@ -490,9 +776,11 @@ export default function HomePage() {
       const channelsHeader = response.headers.get("x-audio-channels");
       const sampleRate = Number(sampleRateHeader);
       const channels = Number(channelsHeader);
+      const bytesPerSample = codec ? bytesPerSampleForCodec(codec) : null;
 
       if (
-        codec !== "linear16" ||
+        !codec ||
+        !bytesPerSample ||
         !Number.isFinite(sampleRate) ||
         sampleRate <= 0 ||
         channels !== 1
@@ -522,7 +810,7 @@ export default function HomePage() {
           carry = new Uint8Array(0);
         }
 
-        const remainder = combined.byteLength % 2;
+        const remainder = combined.byteLength % bytesPerSample;
         if (remainder !== 0) {
           carry = combined.slice(combined.byteLength - remainder);
           combined = combined.slice(0, combined.byteLength - remainder);
@@ -531,12 +819,12 @@ export default function HomePage() {
         if (combined.byteLength === 0) continue;
 
         pcmChunks.push(combined);
-        schedulePcmChunk(audioContext, combined, sampleRate);
+        schedulePcmChunk(audioContext, combined, codec, sampleRate);
       }
 
       if (carry.byteLength > 0) {
         appendLog(
-          `[audio] ignored ${carry.byteLength} trailing byte(s) from the PCM stream because a 16-bit sample must be 2 bytes`,
+          `[audio] ignored ${carry.byteLength} trailing byte(s) from the raw audio stream because a complete ${codec} sample was not available yet`,
         );
       }
 
@@ -546,7 +834,7 @@ export default function HomePage() {
       }
 
       const nextUrl = URL.createObjectURL(
-        buildWaveBlobFromPcmChunks(pcmChunks, sampleRate),
+        buildWaveBlobFromPcmChunks(pcmChunks, codec, sampleRate),
       );
       replaceAudioUrl(nextUrl);
     } catch (err) {
@@ -600,6 +888,35 @@ export default function HomePage() {
     }
 
     await speakStreamingText(finalResponse, { interruptCurrent: true });
+  }
+
+  function handleTtsProviderChange(nextProviderId: string) {
+    const providerOption = findProviderOption(nextProviderId);
+    const nextVoicePreset =
+      providerOption?.default_voice_preset ?? providerOption?.voices[0]?.id ?? "";
+    if (!providerOption || !nextVoicePreset) {
+      return;
+    }
+    applyTtsSelection(nextProviderId, nextVoicePreset);
+  }
+
+  function handleVoicePresetChange(nextVoicePreset: string) {
+    if (!nextVoicePreset.trim()) {
+      return;
+    }
+    applyTtsSelection(selectedTtsProvider, nextVoicePreset);
+  }
+
+  async function previewSelectedVoice() {
+    const previewText = voicePreviewText.trim();
+    if (!previewText) {
+      setAssistantStatus("Enter preview text before playing a voice sample.");
+      return;
+    }
+
+    await unlockAudioPlaybackFromUserGesture();
+    interruptSpeechPlayback();
+    await speakBufferedText(previewText);
   }
 
   async function uploadRecordedAudio(blob: Blob) {
@@ -957,8 +1274,12 @@ export default function HomePage() {
     }
   }
 
+  const currentTtsProviderOption = findProviderOption(selectedTtsProvider);
+  const currentVoiceOptions = currentTtsProviderOption?.voices ?? [];
   const controlsDisabled =
     warmingUp || running || recording || transcribing || !backendBaseUrl;
+  const ttsSettingsDisabled =
+    warmingUp || recording || transcribing || !backendBaseUrl || ttsOptionsLoading;
   const statusState = recording
     ? "recording"
     : running
@@ -1106,6 +1427,101 @@ export default function HomePage() {
             placeholder="Ask about vehicle safety, recalls, or crash-analysis context."
             disabled={!warmedUp || warmingUp || running || recording || transcribing}
           />
+
+          <section className="voice-settings-panel" aria-label="Voice settings">
+            <div className="panel-heading compact">
+              <div>
+                <p className="section-kicker">Speech output</p>
+                <h2>Voice preset</h2>
+              </div>
+              <button
+                type="button"
+                className="button button-ghost button-inline"
+                onClick={() => setVoiceSettingsOpen((prev) => !prev)}
+                disabled={!backendBaseUrl || ttsOptionsLoading}
+              >
+                {voiceSettingsOpen ? "Hide voice options" : "Choose voice"}
+              </button>
+            </div>
+
+            {voiceSettingsOpen ? (
+              <>
+                <div className="tts-grid">
+                  <label className="tts-control" htmlFor="tts-provider-select">
+                    <span>TTS provider</span>
+                    <select
+                      id="tts-provider-select"
+                      className="tts-select"
+                      value={selectedTtsProvider}
+                      onChange={(event) => handleTtsProviderChange(event.target.value)}
+                      disabled={ttsSettingsDisabled}
+                    >
+                      {ttsProviders.map((provider) => (
+                        <option key={provider.id} value={provider.id}>
+                          {provider.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="tts-control" htmlFor="tts-voice-select">
+                    <span>Voice preset</span>
+                    <select
+                      id="tts-voice-select"
+                      className="tts-select"
+                      value={selectedVoicePreset}
+                      onChange={(event) => handleVoicePresetChange(event.target.value)}
+                      disabled={ttsSettingsDisabled || currentVoiceOptions.length === 0}
+                    >
+                      {currentVoiceOptions.map((voice) => (
+                        <option key={voice.id} value={voice.id}>
+                          {voice.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+
+                {currentTtsProviderOption ? (
+                  <p className="tts-helper">
+                    {currentTtsProviderOption.description}
+                    {currentTtsProviderOption.supports_streaming
+                      ? " Live streamed playback is available for this provider."
+                      : " This provider currently uses buffered WAV playback in the hosted UI."}
+                  </p>
+                ) : null}
+
+                <label className="composer-label" htmlFor="voice-preview-input">
+                  Preview text
+                </label>
+                <textarea
+                  id="voice-preview-input"
+                  value={voicePreviewText}
+                  onChange={(event) => setVoicePreviewText(event.target.value)}
+                  rows={3}
+                  className="request-input request-input-compact"
+                  placeholder={fallbackVoicePreviewText}
+                  disabled={ttsSettingsDisabled}
+                />
+
+                <div className="action-row action-row-compact">
+                  <button
+                    type="button"
+                    className="button button-secondary"
+                    onClick={previewSelectedVoice}
+                    disabled={
+                      ttsSettingsDisabled ||
+                      speaking ||
+                      running ||
+                      voicePreviewText.trim().length === 0
+                    }
+                  >
+                    {speaking ? "Playing preview..." : "Play preview"}
+                  </button>
+                </div>
+              </>
+            ) : null}
+          </section>
 
           <div className="action-row">
             <button
