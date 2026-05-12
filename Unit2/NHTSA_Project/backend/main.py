@@ -143,15 +143,30 @@ def _clear_agentic_session(session_id: str) -> None:
     _AGENTIC_SESSIONS.pop(session_id, None)
 
 
-def _state_is_resumable_agentic(state: dict[str, Any]) -> bool:
+def _state_is_resumable_session(state: dict[str, Any]) -> bool:
     """
-    Persist only sessions that can actually continue a later follow-up turn.
+    Persist only sessions that can actually continue a later browser turn.
 
-    The hosted continuation contract applies only to the agentic branch, and it
-    requires a serialized internal message transcript. Non-agentic runs or
-    agentic runs that never produced conversation_messages should not occupy the
-    session store.
+    Two hosted continuation modes exist today:
+
+    * agentic follow-ups:
+        the branch keeps a serialized internal message transcript so later
+        browser turns can continue the same conversation
+    * clarification checkpoints:
+        any branch can pause on a voice_ask_user / Ask_User prompt and wait for
+        the browser to send the human's answer back on the next /run request
+
+    Any other completed run should be discarded once the SSE stream ends.
     """
+    if (
+        state.get("awaiting_clarification")
+        and isinstance(state.get("conversation_messages"), list)
+        and len(state.get("conversation_messages") or []) > 0
+        and str(state.get("pending_clarification_tool_call_id") or "").strip()
+        and str(state.get("pending_clarification_question") or "").strip()
+    ):
+        return True
+
     return (
         state.get("task_type") == "agentic_retrieve_and_analyze"
         and state.get("agentic_subtype") in {"agentic_analyze", "agentic_explore"}
@@ -615,7 +630,7 @@ async def stream_speech(req: SpeechRequest) -> StreamingResponse:
 
     * Deepgram -> linear16, 24000 Hz, mono
     * Cartesia -> pcm_f32le, 44100 Hz, mono
-    * OpenAI   -> pcm16, 24000 Hz, mono (best-effort inferred contract)
+    * OpenAI   -> pcm16, 24000 Hz, mono
 
     The registry route tells the frontend which providers support streaming.
     Unsupported providers should use the buffered WAV endpoint instead of
@@ -778,7 +793,7 @@ async def run(req: RunRequest) -> StreamingResponse:
                 prior_state=prior_state,
                 final_state_sink=final_state_box,
             ):
-                if event.get("event") in {"started", "completed"}:
+                if event.get("event") in {"started", "completed", "clarification_required"}:
                     event = {
                         **event,
                         "data": {
@@ -791,7 +806,7 @@ async def run(req: RunRequest) -> StreamingResponse:
             final_state = final_state_box.get("state")
             succeeded = final_state_box.get("succeeded") is True
             if succeeded and isinstance(final_state, dict):
-                if _state_is_resumable_agentic(final_state):
+                if _state_is_resumable_session(final_state):
                     _store_agentic_session(session_id, final_state)
                 else:
                     _clear_agentic_session(session_id)

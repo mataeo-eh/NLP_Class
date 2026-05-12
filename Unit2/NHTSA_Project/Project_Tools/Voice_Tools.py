@@ -42,7 +42,11 @@ ThreadPoolExecutor (standard LangGraph tool-execution pattern).
 import sys
 from pathlib import Path
 from langchain_core.tools import tool
-from Project_Tools.Runtime_Options import is_audio_enabled, is_headless_mode
+from Project_Tools.Runtime_Options import (
+    HostedUserInteractionRequired,
+    is_audio_enabled,
+    is_headless_mode,
+)
 
 # ---------------------------------------------------------------------------
 # Path wiring — Audio_Playback and Audio_Capture live in the same directory
@@ -77,20 +81,14 @@ def voice_ask_user(question: str) -> str:
         The Whisper transcript of the user's spoken reply, or an error string
         starting with '[voice tool error:' if audio I/O fails.
     """
-    # Headless mode (FastAPI on Render): there is no human at stdin and no
-    # microphone / speaker on the server, so the tool must NOT call input() or
-    # try to capture audio — both would either block forever or crash. Instead
-    # we return a structured refusal string. The agentic loop's prompts
-    # already instruct the model to "adapt rather than retry" when a tool
-    # signals it cannot complete, so the LLM will keep going with whatever
-    # information it already has.
+    # Headless mode (FastAPI hosted backend): there is still a real human, but
+    # that human lives in the browser rather than at this Python process. The
+    # backend therefore cannot satisfy the question synchronously via local
+    # mic/speaker I/O. Raise a structured pause signal instead so the FastAPI
+    # adapter can emit a clarification event, let the browser collect the
+    # answer, and resume the exact tool call on the next /run request.
     if is_headless_mode():
-        return (
-            "[voice_ask_user unavailable: this process is running in a hosted "
-            "headless environment with no microphone, speakers, or stdin. "
-            "Proceed with the data you already have and produce your best "
-            "answer without asking the user a follow-up question.]"
-        )
+        raise HostedUserInteractionRequired(question, result_mode="direct_answer")
 
     if not is_audio_enabled():
         # Keep the tool contract identical in text mode: the LLM still calls the

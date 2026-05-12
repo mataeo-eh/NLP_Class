@@ -48,18 +48,27 @@ class State(TypedDict):
     #               agentic sub-graph node.
     agentic_subtype: str
 
-    # Serialized LangChain message history for the active agentic conversation.
-    # This is ONLY populated by the agentic nodes. It preserves the exact
-    # system / user / assistant / tool exchange that occurred inside the
-    # node-local llm.invoke(...) loop so a later follow-up can rebuild the same
-    # conversational context instead of starting from a blank prompt.
+    # Serialized LangChain message history for any hosted resumable interaction.
+    #
+    # Primary use:
+    #   Agentic follow-up sessions persist the exact system / user / assistant /
+    #   tool exchange that occurred inside the node-local llm.invoke(...) loop so
+    #   a later /run follow-up can rebuild the same conversational context
+    #   instead of starting from a blank prompt.
+    #
+    # Secondary use:
+    #   Hosted clarification checkpoints (voice_ask_user / Ask_User mid-loop)
+    #   persist the outstanding tool-call transcript so the browser can answer
+    #   the question on a later /run request and the graph can resume from the
+    #   exact tool call that paused the run.
     #
     # Storage format:
     #   list[dict] produced by langchain_core.messages.messages_to_dict(...)
     #
-    # Populated by: agentic_analyze and agentic_explore (Nodes.py)
-    # Consumed by:  those same nodes on a later follow-up run when
-    #               resume_agentic_session == True.
+    # Populated by: retrieve_data (only when hosted clarification pauses the
+    #               loop), agentic_analyze, and agentic_explore (Nodes.py)
+    # Consumed by:  those same nodes on a later follow-up / clarification resume
+    #               run.
     conversation_messages: list[dict]
 
     # Explicit backend-controlled flag that says "this /run call is a follow-up
@@ -72,6 +81,42 @@ class State(TypedDict):
     #               nodes to short-circuit classification and restore prior
     #               conversational history.
     resume_agentic_session: bool
+
+    # Hosted clarification checkpoint flag.
+    #
+    # True means the current run intentionally paused because a human-facing
+    # question must be answered in the browser before the graph can continue.
+    # The backend persists the state snapshot and emits a dedicated
+    # clarification-required SSE event instead of a final answer. The next /run
+    # request for the same session id carries the user's answer and resumes the
+    # paused tool call.
+    awaiting_clarification: bool
+
+    # Exact question the browser should display/speak when
+    # awaiting_clarification is True.
+    pending_clarification_question: str
+
+    # LangChain tool_call_id of the interactive tool invocation that paused the
+    # run. On resume, this lets the backend inject the user's answer back into
+    # the transcript as the correct ToolMessage.
+    pending_clarification_tool_call_id: str
+
+    # Name of the tool that requested clarification (for example voice_ask_user
+    # or Ask_User). This is user-facing/debugging metadata only.
+    pending_clarification_tool_name: str
+
+    # Resume contract for the outstanding interactive tool call:
+    #   - "direct_answer"       -> resume injects the browser's answer as the
+    #                              ToolMessage content for the original tool call
+    #   - "confirm_then_answer" -> resume injects the Ask_User confirmation
+    #                              ToolMessage, then User_Answer() consumes the
+    #                              stored browser answer from Runtime_Options
+    pending_clarification_result_mode: str
+
+    # Browser-supplied answer for the outstanding clarification prompt. The
+    # backend seeds this field when a follow-up /run resumes a clarification
+    # checkpoint.
+    pending_clarification_answer: str
 
     # User confirmation gate between the analyze node and csv_append. The
     # confirm_csv_write node sets this flag to True when the user explicitly

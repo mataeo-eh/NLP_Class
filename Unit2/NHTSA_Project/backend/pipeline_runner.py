@@ -13,9 +13,9 @@ Responsibilities
 
 2. Flip the process-wide runtime flags BEFORE the graph module is imported:
        set_audio_enabled(False)   - no mic/speakers exist on Render
-       set_headless_mode(True)    - tells voice_ask_user / code_exec /
-                                    confirm_csv_write / narrate_* to refuse
-                                    or no-op instead of blocking on input()
+       set_headless_mode(True)    - tells interactive tools to route through
+                                    hosted clarification checkpoints instead of
+                                    blocking on local stdin / audio devices
    The order matters: the graph module's transitive imports touch tools that
    read these flags at call time, so they must be set first.
 
@@ -67,6 +67,7 @@ for path in (str(LANGGRAPH_DIR), str(LLM_TOOLS_DIR), str(PROJECT_ROOT)):
 # ---------------------------------------------------------------------------
 from Project_Tools.Runtime_Options import (  # noqa: E402  (intentional import order)
     set_audio_enabled,
+    set_headless_clarification_response,
     set_headless_narration_sink,
     set_headless_mode,
 )
@@ -119,6 +120,12 @@ def _initial_state(user_request: str) -> dict[str, Any]:
         "agentic_subtype": "",
         "conversation_messages": [],
         "resume_agentic_session": False,
+        "awaiting_clarification": False,
+        "pending_clarification_question": "",
+        "pending_clarification_tool_call_id": "",
+        "pending_clarification_tool_name": "",
+        "pending_clarification_result_mode": "",
+        "pending_clarification_answer": "",
         "iteration_log": [],
     }
 
@@ -143,7 +150,12 @@ def _seed_state_for_request(
     seeded_state["response"] = ""
     seeded_state["reasoning_output"] = ""
     seeded_state["csv_write_confirmed"] = False
-    seeded_state["resume_agentic_session"] = True
+    seeded_state["resume_agentic_session"] = bool(
+        seeded_state.get("task_type") == "agentic_retrieve_and_analyze"
+    )
+    awaiting_clarification = bool(seeded_state.get("awaiting_clarification"))
+    seeded_state["pending_clarification_answer"] = user_request if awaiting_clarification else ""
+    seeded_state["awaiting_clarification"] = False
     return seeded_state, True
 
 
@@ -201,7 +213,16 @@ def _summarise_delta(delta: dict[str, Any]) -> dict[str, Any]:
             # into TTS. Suppressing it here keeps END-bound hosted runs from
             # showing redundant intermediate reasoning.
             continue
-        if key in ("conversation_messages", "resume_agentic_session"):
+        if key in (
+            "conversation_messages",
+            "resume_agentic_session",
+            "awaiting_clarification",
+            "pending_clarification_question",
+            "pending_clarification_tool_call_id",
+            "pending_clarification_tool_name",
+            "pending_clarification_result_mode",
+            "pending_clarification_answer",
+        ):
             # These fields are purely backend session bookkeeping. Shipping the
             # full restored transcript over SSE would bloat every node_update,
             # and the resume flag has no user-facing value in the raw event log.
@@ -282,7 +303,19 @@ async def stream_pipeline(
     def enqueue_narration(text: str) -> None:
         narration_queue.append(text)
 
+    pending_clarification_answer = str(
+        working_state.get("pending_clarification_answer") or ""
+    ).strip()
+    pending_clarification_result_mode = str(
+        working_state.get("pending_clarification_result_mode") or ""
+    ).strip()
+
     set_headless_narration_sink(enqueue_narration)
+    set_headless_clarification_response(
+        pending_clarification_answer
+        if pending_clarification_answer and pending_clarification_result_mode == "confirm_then_answer"
+        else None
+    )
     try:
         # LangGraph's astream() with default stream_mode emits one chunk per
         # node completion. Each chunk is a {node_name: state_delta} dict. We
@@ -321,23 +354,37 @@ async def stream_pipeline(
         # Each value is the structured summary dict already stored by the tool
         # wrapper — safe to JSON-serialise via _to_jsonable.
         charts_snapshot = _to_jsonable(dict(_chart_tools_module._LAST_CHART_DATA))
-        yield {
-            "event": "completed",
-            "data": {
-                # `response` is the field the original CLI feeds into TTS via
-                # json_to_spoken_text. The frontend can render it directly as
-                # the final answer text.
-                "response": _to_jsonable(final_state.get("response", "")),
-                "task_type": final_state.get("task_type", ""),
-                "continued": resumed,
-                "analysis_prompt_name": final_state.get("analysis_prompt_name", ""),
-                "row_count": len(final_state.get("query_result") or []),
-                "analysis_count": len(final_state.get("analysis") or []),
-                # chart summaries keyed by chart_name — empty dict when no
-                # chart tools were called during this run
-                "charts": charts_snapshot,
-            },
-        }
+        if final_state.get("awaiting_clarification"):
+            yield {
+                "event": "clarification_required",
+                "data": {
+                    "question": _to_jsonable(final_state.get("pending_clarification_question", "")),
+                    "tool_name": _to_jsonable(final_state.get("pending_clarification_tool_name", "")),
+                    "result_mode": _to_jsonable(
+                        final_state.get("pending_clarification_result_mode", "")
+                    ),
+                    "task_type": final_state.get("task_type", ""),
+                    "continued": resumed,
+                },
+            }
+        else:
+            yield {
+                "event": "completed",
+                "data": {
+                    # `response` is the field the original CLI feeds into TTS via
+                    # json_to_spoken_text. The frontend can render it directly as
+                    # the final answer text.
+                    "response": _to_jsonable(final_state.get("response", "")),
+                    "task_type": final_state.get("task_type", ""),
+                    "continued": resumed,
+                    "analysis_prompt_name": final_state.get("analysis_prompt_name", ""),
+                    "row_count": len(final_state.get("query_result") or []),
+                    "analysis_count": len(final_state.get("analysis") or []),
+                    # chart summaries keyed by chart_name — empty dict when no
+                    # chart tools were called during this run
+                    "charts": charts_snapshot,
+                },
+            }
         if final_state_sink is not None:
             final_state_sink["state"] = dict(final_state)
             final_state_sink["succeeded"] = True
@@ -360,6 +407,7 @@ async def stream_pipeline(
             final_state_sink["state"] = dict(final_state)
             final_state_sink["succeeded"] = False
     finally:
+        set_headless_clarification_response(None)
         set_headless_narration_sink(None)
 
 

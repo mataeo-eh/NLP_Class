@@ -17,6 +17,48 @@ optional audio stack.
 
 from collections.abc import Callable
 
+
+class HostedUserInteractionRequired(RuntimeError):
+    """
+    Signal that a hosted/headless run must pause and ask the browser user something.
+
+    The local CLI can satisfy interactive tools synchronously via TTS/STT or
+    stdin/stdout. The hosted backend cannot: it has no microphone, speakers, or
+    stdin. Tools such as voice_ask_user therefore raise this exception so the
+    FastAPI adapter can stop the current graph turn, emit a structured
+    clarification event to the browser, persist the resumable state, and resume
+    once the browser sends the user's answer back on the next /run call.
+
+    Attributes
+    ----------
+    question:
+        Exact human-facing question the browser should display and optionally
+        speak aloud.
+    result_mode:
+        How the eventual browser answer should be threaded back into the model's
+        transcript on resume.
+
+        - "direct_answer":
+            The tool itself normally returns the user's answer string
+            immediately (voice_ask_user).
+        - "confirm_then_answer":
+            The first tool call only asks the question and expects a later
+            User_Answer() call to retrieve the stored response.
+    """
+
+    def __init__(self, question: str, *, result_mode: str = "direct_answer") -> None:
+        cleaned_question = question.strip()
+        if not cleaned_question:
+            raise ValueError("HostedUserInteractionRequired needs a non-empty question.")
+        if result_mode not in {"direct_answer", "confirm_then_answer"}:
+            raise ValueError(
+                "HostedUserInteractionRequired.result_mode must be "
+                "'direct_answer' or 'confirm_then_answer'."
+            )
+        super().__init__(cleaned_question)
+        self.question = cleaned_question
+        self.result_mode = result_mode
+
 _AUDIO_ENABLED = False
 
 # Headless mode flag — set to True by the FastAPI backend at startup so every
@@ -40,6 +82,14 @@ _HEADLESS_MODE = False
 # The local CLI never sets this, so existing speaker/stdout behaviour is
 # unchanged outside the hosted path.
 _HEADLESS_NARRATION_SINK: Callable[[str], None] | None = None
+
+# Hosted clarification answer slot.
+#
+# This is used only for the old Ask_User() -> User_Answer() two-step contract
+# when a hosted browser session resumes after the human has answered the
+# clarification prompt. The FastAPI adapter seeds the response before the graph
+# restarts, and User_Answer() consumes it exactly once.
+_HEADLESS_CLARIFICATION_RESPONSE: str | None = None
 
 # Voice-model selector — chosen once at process start by the LangGraph CLI and
 # read by Audio_Playback.generate_TTS_audio on every TTS call. The selector is a
@@ -168,6 +218,36 @@ def emit_headless_narration(text: str) -> None:
         return
     if _HEADLESS_NARRATION_SINK is not None:
         _HEADLESS_NARRATION_SINK(cleaned)
+
+
+def set_headless_clarification_response(text: str | None) -> None:
+    """
+    Register or clear the hosted clarification answer for User_Answer().
+
+    Passing None clears any prior pending answer. The local CLI never uses this;
+    it exists so the hosted FastAPI adapter can restore the user's browser-side
+    answer into the legacy Ask_User()/User_Answer() tool pair on resume.
+    """
+    global _HEADLESS_CLARIFICATION_RESPONSE
+    if text is None:
+        _HEADLESS_CLARIFICATION_RESPONSE = None
+        return
+    cleaned = text.strip()
+    _HEADLESS_CLARIFICATION_RESPONSE = cleaned or None
+
+
+def consume_headless_clarification_response() -> str | None:
+    """
+    Return and clear the hosted clarification answer, if one is waiting.
+
+    The answer is single-use on purpose: once User_Answer() has returned it to
+    the model, any subsequent call should not silently replay stale browser
+    input from an earlier clarification checkpoint.
+    """
+    global _HEADLESS_CLARIFICATION_RESPONSE
+    answer = _HEADLESS_CLARIFICATION_RESPONSE
+    _HEADLESS_CLARIFICATION_RESPONSE = None
+    return answer
 
 
 def set_voice_model(model: str) -> None:
