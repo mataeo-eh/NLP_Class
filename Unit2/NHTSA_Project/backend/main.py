@@ -9,6 +9,7 @@ It exposes the LangGraph NHTSA complaint-analysis pipeline as an HTTP API:
     GET  /             -> service banner (sanity check)
     GET  /health       -> 200 OK probe for Railway's healthcheck
     POST /session/warmup -> returns the CLI greeting text for frontend warmup
+    GET  /audio/tts/options -> provider + voice registry for the frontend
     POST /run          -> Server-Sent Events stream of pipeline progress
     POST /audio/transcribe -> browser audio upload to transcript JSON
     POST /audio/speech     -> text to browser-playable WAV bytes
@@ -60,12 +61,16 @@ from LLM_Tools.MCP_To_Tools import (
 )
 from audio_io import (
     MAX_AUDIO_UPLOAD_BYTES,
-    _DEEPGRAM_CHANNELS,
-    _DEEPGRAM_PCM_ENCODING,
-    _DEEPGRAM_SAMPLE_RATE,
+    get_streaming_audio_contract,
     synthesize_speech_pcm_stream,
     synthesize_speech_wav,
     transcribe_audio_bytes,
+)
+from tts_registry import (
+    get_default_hosted_tts_preview_text,
+    get_default_hosted_tts_provider,
+    get_default_hosted_voice_preset,
+    list_hosted_tts_providers,
 )
 
 
@@ -269,16 +274,12 @@ class RunRequest(BaseModel):
 
 class SpeechRequest(BaseModel):
     """
-    Request body for POST /audio/speech.
+    Hosted speech request accepted by both /audio/speech and /audio/speech/stream.
 
-    Deepgram's speech endpoint accepts several synthesis fields. The hosted backend
-    exposes only the ones this app needs:
-
-    * text: final answer or any frontend text to speak.
-    The Deepgram model id is intentionally owned server-side by the existing
-    Runtime_Options voice preset. For Deepgram, that model id is also the voice
-    selection, so the frontend cannot accidentally bypass the pre-selected
-    voice.
+    The frontend can send a provider/voice pair on every request so hosted users
+    are not forced to share one process-wide TTS selector. That also makes
+    mid-run switching feasible: future narration requests can move to a new
+    provider/voice without restarting the pipeline.
     """
 
     text: str = Field(
@@ -287,6 +288,48 @@ class SpeechRequest(BaseModel):
         max_length=4096,
         description="Text to synthesize as browser-playable WAV audio.",
     )
+    tts_provider: str | None = Field(
+        default=None,
+        description=(
+            "Optional hosted TTS provider id. When omitted, the backend keeps "
+            "the current hosted default provider."
+        ),
+    )
+    voice_preset: str | None = Field(
+        default=None,
+        description=(
+            "Optional voice preset for the selected provider. When omitted, the "
+            "provider's default hosted voice is used."
+        ),
+    )
+
+
+class TtsVoiceOption(BaseModel):
+    """One selectable hosted voice for one provider."""
+
+    id: str
+    label: str
+    description: str
+
+
+class TtsProviderOption(BaseModel):
+    """Hosted provider metadata plus its provider-specific voice list."""
+
+    id: str
+    label: str
+    description: str
+    supports_streaming: bool
+    default_voice_preset: str
+    voices: list[TtsVoiceOption]
+
+
+class TtsOptionsResponse(BaseModel):
+    """Frontend bootstrap payload for provider and voice dropdowns."""
+
+    default_tts_provider: str
+    default_voice_preset: str
+    default_preview_text: str
+    providers: list[TtsProviderOption]
 
 
 class WarmupResponse(BaseModel):
@@ -321,8 +364,8 @@ async def read_root() -> dict[str, str]:
         "status": "ok",
         "version": app.version,
         "endpoints": (
-            "GET /health, POST /session/warmup, POST /run, POST /audio/transcribe, "
-            "POST /audio/speech, POST /audio/speech/stream"
+            "GET /health, POST /session/warmup, GET /audio/tts/options, POST /run, "
+            "POST /audio/transcribe, POST /audio/speech, POST /audio/speech/stream"
         ),
     }
 
@@ -362,6 +405,31 @@ async def warmup_session() -> WarmupResponse:
     return WarmupResponse(
         welcome_text=WELCOME_TTS_TEXT,
         ready_prompt="Speak now.",
+    )
+
+
+@app.get("/audio/tts/options", response_model=TtsOptionsResponse)
+async def get_tts_options() -> TtsOptionsResponse:
+    """
+    Return the hosted TTS provider and voice registry for the frontend.
+
+    The response is explicit rather than inferred from backend internals so the
+    client can deterministically:
+
+    * populate the provider dropdown,
+    * swap the voice dropdown options when the provider changes,
+    * preserve the current hosted default selection,
+    * decide whether the selected provider supports the low-latency stream route.
+    """
+    default_provider = get_default_hosted_tts_provider()
+    return TtsOptionsResponse(
+        default_tts_provider=default_provider,
+        default_voice_preset=get_default_hosted_voice_preset(default_provider),
+        default_preview_text=get_default_hosted_tts_preview_text(),
+        providers=[
+            TtsProviderOption.model_validate(provider)
+            for provider in list_hosted_tts_providers()
+        ],
     )
 
 
@@ -437,6 +505,8 @@ async def synthesize_speech(req: SpeechRequest) -> Response:
             audio_bytes = await asyncio.to_thread(
                 synthesize_speech_wav,
                 req.text,
+                tts_provider=req.tts_provider,
+                voice_preset=req.voice_preset,
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -475,13 +545,26 @@ async def stream_speech(req: SpeechRequest) -> StreamingResponse:
     chunked output as a streaming HTTP body so the frontend can schedule each
     PCM chunk in the Web Audio API as soon as it arrives.
 
+    Provider note
+    -------------
+    Deepgram, Cartesia, and OpenAI are wired into this raw-audio contract
+    today, but they do NOT share the same byte format:
+
+    * Deepgram -> linear16, 24000 Hz, mono
+    * Cartesia -> pcm_f32le, 44100 Hz, mono
+    * OpenAI   -> pcm16, 24000 Hz, mono (best-effort inferred contract)
+
+    The registry route tells the frontend which providers support streaming.
+    Unsupported providers should use the buffered WAV endpoint instead of
+    guessing.
+
     Explicit frontend contract
     --------------------------
     The response body is NOT a self-describing audio container. The frontend
     must read the headers below and handle them programmatically:
 
-    * `X-Audio-Codec: linear16`
-    * `X-Audio-Sample-Rate: 24000`
+    * `X-Audio-Codec: <provider-specific raw codec>`
+    * `X-Audio-Sample-Rate: <provider-specific sample rate>`
     * `X-Audio-Channels: 1`
 
     If the browser client cannot handle that contract, it should fall back to
@@ -496,7 +579,15 @@ async def stream_speech(req: SpeechRequest) -> StreamingResponse:
     await _AUDIO_SLOTS.acquire()
     try:
         try:
-            pcm_chunks = synthesize_speech_pcm_stream(req.text)
+            stream_contract = get_streaming_audio_contract(
+                tts_provider=req.tts_provider,
+                voice_preset=req.voice_preset,
+            )
+            pcm_chunks = synthesize_speech_pcm_stream(
+                req.text,
+                tts_provider=req.tts_provider,
+                voice_preset=req.voice_preset,
+            )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -516,9 +607,9 @@ async def stream_speech(req: SpeechRequest) -> StreamingResponse:
             media_type="application/octet-stream",
             headers={
                 "Cache-Control": "no-store",
-                "X-Audio-Codec": _DEEPGRAM_PCM_ENCODING,
-                "X-Audio-Sample-Rate": str(_DEEPGRAM_SAMPLE_RATE),
-                "X-Audio-Channels": str(_DEEPGRAM_CHANNELS),
+                "X-Audio-Codec": str(stream_contract["codec"]),
+                "X-Audio-Sample-Rate": str(stream_contract["sample_rate"]),
+                "X-Audio-Channels": str(stream_contract["channels"]),
             },
         )
     except Exception:

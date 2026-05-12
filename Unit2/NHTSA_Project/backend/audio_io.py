@@ -25,6 +25,10 @@ from io import BytesIO
 from pathlib import Path
 
 import requests
+from tts_registry import (
+    get_default_hosted_voice_preset,
+    resolve_hosted_tts_selection,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -83,11 +87,16 @@ _ALLOWED_AUDIO_SUFFIXES = {
 # and intentionally avoid exposing provider internals as frontend contract.
 _OPENAI_TRANSCRIPTIONS_URL = "https://api.openai.com/v1/audio/transcriptions"
 _OPENAI_STT_MODEL = os.environ.get("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
+_OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
+_OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+_OPENAI_STREAM_SAMPLE_RATE = 24000
+_OPENAI_STREAM_CHANNELS = 1
+_OPENAI_STREAM_PCM_ENCODING = "pcm16"
 
-# Keep backend TTS aligned with the existing CLI voice configuration. The
-# Project_Tools modules live one directory above backend/, so this small path
-# bootstrap lets audio_io.py be imported both through main.py and directly in
-# local smoke tests.
+# The hosted backend still reuses shared project modules above backend/ (for
+# example pipeline_runner imports Graph -> Project_Tools.*). This small path
+# bootstrap lets audio_io.py import those shared modules when needed and also
+# keeps direct local smoke tests working from the backend/ directory.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -103,6 +112,13 @@ if str(PROJECT_ROOT) not in sys.path:
 _DEEPGRAM_SAMPLE_RATE = 24000
 _DEEPGRAM_CHANNELS = 1
 _DEEPGRAM_PCM_ENCODING = "linear16"
+_CARTESIA_TTS_URL = "https://api.cartesia.ai/tts/bytes"
+_CARTESIA_VERSION = os.environ.get("CARTESIA_VERSION", "2025-04-16")
+_CARTESIA_TTS_MODEL = os.environ.get("CARTESIA_TTS_MODEL", "sonic-3.5")
+_CARTESIA_SAMPLE_RATE = 44100
+_CARTESIA_CHANNELS = 1
+_CARTESIA_PCM_ENCODING = "pcm_f32le"
+_HTTP_STREAM_CHUNK_SIZE = 4096
 
 
 def _safe_filename(filename: str | None) -> str:
@@ -171,6 +187,18 @@ def _openai_headers(*, json_body: bool = False) -> dict[str, str]:
     return headers
 
 
+def _cartesia_headers() -> dict[str, str]:
+    """Build Cartesia auth headers from Railway's CARTESIA_API_KEY secret."""
+    api_key = os.environ.get("CARTESIA_API_KEY")
+    if not api_key:
+        raise RuntimeError("Cartesia TTS is not configured. Set CARTESIA_API_KEY in Railway.")
+    return {
+        "Authorization": f"Bearer {api_key}",
+        "Cartesia-Version": _CARTESIA_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
 def transcribe_audio_bytes(
     payload: bytes,
     filename: str | None,
@@ -215,22 +243,23 @@ def transcribe_audio_bytes(
     }
 
 
-def _deepgram_model_id() -> str:
+def _deepgram_model_id(voice_preset: str | None = None) -> str:
     """
-    Return the existing project-selected Deepgram voice/model id.
+    Return the Deepgram voice/model id for one hosted speech request.
 
-    Runtime_Options is the project's source of truth for voice presets. For
-    Deepgram, the "preset" is the model id itself, for example
-    aura-2-hyperion-en. We use the same default here so the hosted backend voice
-    matches the local CLI unless Railway explicitly sets DEEPGRAM_TTS_MODEL.
+    Deepgram bakes voice and language into one model id (for example
+    aura-2-hyperion-en). The hosted frontend can send an explicit voice preset
+    per request. When it omits one, the backend preserves the historical
+    default path: DEEPGRAM_TTS_MODEL env override first, otherwise the hosted
+    registry default.
     """
+    if voice_preset:
+        return voice_preset
     env_model = os.environ.get("DEEPGRAM_TTS_MODEL")
     if env_model:
         return env_model
 
-    from Project_Tools.Runtime_Options import get_default_voice_preset  # noqa: PLC0415
-
-    return get_default_voice_preset("deepgram")
+    return get_default_hosted_voice_preset("deepgram")
 
 
 def _deepgram_api_key() -> str:
@@ -242,6 +271,143 @@ def _deepgram_api_key() -> str:
             "DEEPGRAM_API_KEY in Railway."
         )
     return api_key
+
+
+def _synthesize_openai_speech_wav(
+    *,
+    text: str,
+    voice_preset: str,
+) -> bytes:
+    """
+    Synthesize WAV bytes through OpenAI's hosted speech endpoint.
+
+    Documented request fields handled here:
+    * model           -> gpt-4o-mini-tts by default, configurable via env
+    * input           -> raw text to speak
+    * voice           -> one built-in OpenAI voice id selected by the frontend
+    * response_format -> wav so the browser can play the response directly
+    """
+    response = requests.post(
+        _OPENAI_TTS_URL,
+        headers=_openai_headers(json_body=True),
+        json={
+            "model": _OPENAI_TTS_MODEL,
+            "input": text,
+            "voice": voice_preset,
+            "response_format": "wav",
+        },
+        timeout=120,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"OpenAI speech request failed: HTTP {response.status_code}: {response.text}"
+        )
+    if not response.content:
+        raise RuntimeError("OpenAI speech request returned no audio bytes.")
+    return response.content
+
+
+def _stream_openai_speech_pcm(
+    *,
+    text: str,
+    voice_preset: str,
+) -> Iterator[bytes]:
+    """
+    Best-effort streamed OpenAI speech path for the hosted backend.
+
+    This is an informed implementation guess based on the official speech docs:
+    request raw PCM audio from `/v1/audio/speech`, ask for streamed audio
+    delivery, and treat the returned body as incremental mono PCM chunks.
+
+    Assumed contract for the frontend:
+    * codec       -> pcm16
+    * sample_rate -> 24000
+    * channels    -> 1
+
+    If OpenAI's live wire contract differs in practice, this path can be
+    adjusted without changing the higher-level provider-selection design.
+    """
+    response = requests.post(
+        _OPENAI_TTS_URL,
+        headers=_openai_headers(json_body=True),
+        json={
+            "model": _OPENAI_TTS_MODEL,
+            "input": text,
+            "voice": voice_preset,
+            "response_format": "pcm",
+            "stream_format": "audio",
+        },
+        stream=True,
+        timeout=120,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"OpenAI speech stream request failed: HTTP {response.status_code}: "
+            f"{response.text}"
+        )
+    return _iter_http_audio_chunks(response)
+
+
+def _synthesize_cartesia_speech_wav(
+    *,
+    text: str,
+    voice_preset: str,
+) -> bytes:
+    """
+    Synthesize WAV bytes through Cartesia's bytes endpoint.
+
+    Documented request fields handled here:
+    * model_id       -> Sonic model id, configurable via env
+    * transcript     -> raw text to speak
+    * voice.mode/id  -> hosted registry voice id chosen by the frontend
+    * output_format  -> explicit WAV container so the browser can replay it
+    """
+    response = requests.post(
+        _CARTESIA_TTS_URL,
+        headers=_cartesia_headers(),
+        json={
+            "model_id": _CARTESIA_TTS_MODEL,
+            "transcript": text,
+            "voice": {
+                "mode": "id",
+                "id": voice_preset,
+            },
+            "output_format": {
+                "container": "wav",
+                "encoding": "pcm_f32le",
+                "sample_rate": _CARTESIA_SAMPLE_RATE,
+            },
+        },
+        timeout=120,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Cartesia speech request failed: HTTP {response.status_code}: {response.text}"
+        )
+    if not response.content:
+        raise RuntimeError("Cartesia speech request returned no audio bytes.")
+    return response.content
+
+
+def _iter_http_audio_chunks(response: requests.Response) -> Iterator[bytes]:
+    """
+    Normalize one HTTP streaming response into non-empty byte chunks.
+
+    Cartesia's bytes endpoint streams the response body incrementally. We keep
+    the contract explicit here: only non-empty `bytes` chunks are yielded, and
+    the underlying response is always closed when iteration ends or aborts.
+    """
+    try:
+        saw_audio = False
+        for chunk in response.iter_content(chunk_size=_HTTP_STREAM_CHUNK_SIZE):
+            if not chunk:
+                continue
+            saw_audio = True
+            yield chunk
+        if not saw_audio:
+            raise RuntimeError("The streaming TTS provider returned no audio bytes.")
+    finally:
+        response.close()
 
 
 def _iter_deepgram_audio_chunks(response) -> Iterator[bytes]:
@@ -321,19 +487,37 @@ def _pcm_s16le_to_wav(pcm_audio: bytes, sample_rate: int) -> bytes:
 
 def synthesize_speech_wav(
     text: str,
+    *,
+    tts_provider: str | None = None,
+    voice_preset: str | None = None,
 ) -> bytes:
     """
-    Synthesize text as WAV bytes through Deepgram's hosted TTS API.
+    Synthesize text as browser-playable WAV bytes through the selected provider.
 
-    Deepgram's Speak v1 SDK documents text, model, encoding, and sample_rate
-    for REST synthesis. The existing project preset supplies the model id, so
-    callers do not send a voice/model override from the frontend. We request raw
-    linear16 PCM to match the local Deepgram path, then wrap it in WAV for
-    browser playback.
+    The hosted frontend sends provider/voice choices on every request instead
+    of mutating one shared process-wide selector. That keeps concurrent browser
+    sessions isolated and lets the frontend switch providers mid-run: each new
+    narration or final-answer speech request can choose a different route.
     """
     cleaned_text = text.strip()
     if not cleaned_text:
         raise ValueError("Text is required for speech synthesis.")
+
+    resolved = resolve_hosted_tts_selection(tts_provider, voice_preset)
+    resolved_provider = resolved["tts_provider"]
+    resolved_voice = resolved["voice_preset"]
+
+    if resolved_provider == "openai":
+        return _synthesize_openai_speech_wav(
+            text=cleaned_text,
+            voice_preset=resolved_voice,
+        )
+
+    if resolved_provider == "cartesia":
+        return _synthesize_cartesia_speech_wav(
+            text=cleaned_text,
+            voice_preset=resolved_voice,
+        )
 
     try:
         from deepgram import DeepgramClient  # noqa: PLC0415
@@ -346,7 +530,7 @@ def synthesize_speech_wav(
     client = DeepgramClient(api_key=_deepgram_api_key())
     response = client.speak.v1.audio.generate(
         text=cleaned_text,
-        model=_deepgram_model_id(),
+        model=_deepgram_model_id(resolved_voice),
         encoding=_DEEPGRAM_PCM_ENCODING,
         sample_rate=_DEEPGRAM_SAMPLE_RATE,
     )
@@ -356,29 +540,70 @@ def synthesize_speech_wav(
 
 def synthesize_speech_pcm_stream(
     text: str,
+    *,
+    tts_provider: str | None = None,
+    voice_preset: str | None = None,
 ) -> Iterator[bytes]:
     """
-    Stream Deepgram speech bytes as raw mono PCM chunks for browser playback.
+    Stream raw audio chunks for browser playback from one supported hosted TTS provider.
 
     Request/response contract
     -------------------------
-    The Deepgram Python SDK documents `client.speak.v1.audio.generate(...)` as
-    returning either a buffered object (`response.stream.getvalue()`) or an
-    iterator of byte chunks. This function normalizes both shapes into one
-    iterator of PCM `bytes` so FastAPI can expose a deterministic streaming
-    contract to the frontend:
+    The selected provider determines the raw byte format:
 
-    * encoding      -> `linear16`
-    * sample_rate   -> 24000 Hz
-    * channels      -> 1 (mono)
+    * Deepgram -> `linear16`, 24000 Hz, mono
+    * Cartesia -> `pcm_f32le`, 44100 Hz, mono
 
-    The frontend reads those values from explicit HTTP headers and uses the Web
-    Audio API to schedule playback chunk-by-chunk after a user gesture unlocks
-    the audio context.
+    The frontend reads the explicit HTTP headers emitted by FastAPI and uses
+    the Web Audio API to schedule playback chunk-by-chunk after a user gesture
+    unlocks the audio context.
     """
     cleaned_text = text.strip()
     if not cleaned_text:
         raise ValueError("Text is required for speech synthesis.")
+
+    resolved = resolve_hosted_tts_selection(tts_provider, voice_preset)
+    resolved_provider = resolved["tts_provider"]
+    resolved_voice = resolved["voice_preset"]
+
+    if resolved_provider == "openai":
+        return _stream_openai_speech_pcm(
+            text=cleaned_text,
+            voice_preset=resolved_voice,
+        )
+
+    if resolved_provider == "cartesia":
+        response = requests.post(
+            _CARTESIA_TTS_URL,
+            headers=_cartesia_headers(),
+            json={
+                "model_id": _CARTESIA_TTS_MODEL,
+                "transcript": cleaned_text,
+                "voice": {
+                    "mode": "id",
+                    "id": resolved_voice,
+                },
+                "output_format": {
+                    "container": "raw",
+                    "encoding": _CARTESIA_PCM_ENCODING,
+                    "sample_rate": _CARTESIA_SAMPLE_RATE,
+                },
+            },
+            stream=True,
+            timeout=120,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Cartesia speech stream request failed: HTTP {response.status_code}: "
+                f"{response.text}"
+            )
+        return _iter_http_audio_chunks(response)
+
+    if resolved_provider != "deepgram":
+        raise ValueError(
+            f"Hosted PCM streaming is not available for provider "
+            f"{resolved_provider!r}. Use /audio/speech instead."
+        )
 
     try:
         from deepgram import DeepgramClient  # noqa: PLC0415
@@ -391,8 +616,47 @@ def synthesize_speech_pcm_stream(
     client = DeepgramClient(api_key=_deepgram_api_key())
     response = client.speak.v1.audio.generate(
         text=cleaned_text,
-        model=_deepgram_model_id(),
+        model=_deepgram_model_id(resolved_voice),
         encoding=_DEEPGRAM_PCM_ENCODING,
         sample_rate=_DEEPGRAM_SAMPLE_RATE,
     )
     return _iter_deepgram_audio_chunks(response)
+
+
+def get_streaming_audio_contract(
+    *,
+    tts_provider: str | None = None,
+    voice_preset: str | None = None,
+) -> dict[str, int | str]:
+    """
+    Return the exact raw-audio contract for one streaming speech request.
+
+    This mirrors synthesize_speech_pcm_stream() so the FastAPI route can emit
+    deterministic headers before the first chunk leaves the server.
+    """
+    resolved = resolve_hosted_tts_selection(tts_provider, voice_preset)
+    resolved_provider = resolved["tts_provider"]
+    if resolved_provider == "openai":
+        return {
+            "tts_provider": resolved_provider,
+            "codec": _OPENAI_STREAM_PCM_ENCODING,
+            "sample_rate": _OPENAI_STREAM_SAMPLE_RATE,
+            "channels": _OPENAI_STREAM_CHANNELS,
+        }
+    if resolved_provider == "deepgram":
+        return {
+            "tts_provider": resolved_provider,
+            "codec": _DEEPGRAM_PCM_ENCODING,
+            "sample_rate": _DEEPGRAM_SAMPLE_RATE,
+            "channels": _DEEPGRAM_CHANNELS,
+        }
+    if resolved_provider == "cartesia":
+        return {
+            "tts_provider": resolved_provider,
+            "codec": _CARTESIA_PCM_ENCODING,
+            "sample_rate": _CARTESIA_SAMPLE_RATE,
+            "channels": _CARTESIA_CHANNELS,
+        }
+    raise ValueError(
+        f"Hosted PCM streaming is not available for provider {resolved_provider!r}."
+    )
