@@ -44,7 +44,8 @@ graph module is imported (see `pipeline_runner.py`):
 
 - `set_audio_enabled(False)` — the mic/speaker code paths never run.
 - `set_headless_mode(True)` — every interactive tool short-circuits:
-  - `voice_ask_user` returns a polite refusal string the LLM can read.
+  - `voice_ask_user` and `Ask_User` raise a hosted clarification checkpoint so
+    the browser can collect the human's answer and resume the same run.
   - `code_exec` is hard-disabled (no sandbox on the public URL).
   - `confirm_csv_write` auto-declines so no CSV is ever mutated server-side.
   - `narrate_node_result` / `narrate_progress` no-op (progress is surfaced

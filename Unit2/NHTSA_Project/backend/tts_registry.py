@@ -86,8 +86,8 @@ _HOSTED_TTS_PROVIDERS = {
         "id": "openai",
         "label": "OpenAI",
         "description": (
-            "OpenAI hosted TTS via /v1/audio/speech. The hosted backend now "
-            "attempts low-latency streamed PCM playback on a best-effort basis."
+            "OpenAI hosted TTS via /v1/audio/speech. The hosted backend uses "
+            "the PCM streaming route for low-latency browser playback."
         ),
         "supports_streaming": True,
         "default_voice_preset": "alloy",

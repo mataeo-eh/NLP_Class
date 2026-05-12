@@ -28,7 +28,7 @@ type SseEvent = {
 };
 
 type ChatTurn = {
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "narrator";
   text: string;
 };
 
@@ -540,12 +540,14 @@ export default function HomePage() {
   const [voicePreviewText, setVoicePreviewText] = useState(fallbackVoicePreviewText);
   const [warmingUp, setWarmingUp] = useState(false);
   const [warmedUp, setWarmedUp] = useState(false);
+  const [awaitingClarification, setAwaitingClarification] = useState(false);
+  const [pendingClarificationQuestion, setPendingClarificationQuestion] = useState("");
   const [running, setRunning] = useState(false);
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const [speaking, setSpeaking] = useState(false);
   const [assistantStatus, setAssistantStatus] = useState(
-    "Press Run pipeline to hear the greeting and unlock the hosted audio flow.",
+    "Press Start session to begin. The hosted controls stay idle until the welcome audio runs.",
   );
   const [log, setLog] = useState("");
   const [finalResponse, setFinalResponse] = useState("");
@@ -842,12 +844,18 @@ export default function HomePage() {
       appendLog(
         "[audio] browser has no AudioContext support; streamed autoplay is unavailable",
       );
+      setAssistantStatus(
+        "This browser cannot unlock streamed audio automatically. Use the replay controls if speech does not start.",
+      );
       return;
     }
 
     if (audioContext.state !== "running") {
       appendLog(
         `[audio] context remained ${audioContext.state} after the user gesture; browser autoplay may still block playback`,
+      );
+      setAssistantStatus(
+        "Audio playback may still be blocked by the browser. If speech stays silent, use Replay audio or Play preview.",
       );
     }
   }
@@ -935,6 +943,15 @@ export default function HomePage() {
     }
   }
 
+  function extractClarificationQuestion(eventData: string): string {
+    try {
+      const payload = JSON.parse(eventData) as { question?: unknown };
+      return typeof payload.question === "string" ? payload.question.trim() : "";
+    } catch {
+      return "";
+    }
+  }
+
   function extractTaskType(eventData: string): string {
     try {
       const payload = JSON.parse(eventData) as { task_type?: unknown };
@@ -994,6 +1011,9 @@ export default function HomePage() {
         await audio.play();
       } catch {
         appendLog("[audio] browser blocked autoplay; use the audio controls below");
+        setAssistantStatus(
+          "Browser autoplay was blocked. Use the audio controls below to play the response.",
+        );
       }
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
@@ -1172,6 +1192,9 @@ export default function HomePage() {
         appendLog("[audio] replay started");
       } catch {
         appendLog("[audio] replay was blocked; use the audio controls below");
+        setAssistantStatus(
+          "Browser playback is still blocked. Use the native audio controls below to start the clip manually.",
+        );
       }
       return;
     }
@@ -1205,7 +1228,10 @@ export default function HomePage() {
 
     await unlockAudioPlaybackFromUserGesture();
     interruptSpeechPlayback();
-    await speakBufferedText(previewText);
+    // Route previews through the same streamed AudioContext path as narration
+    // and final responses. This keeps preview playback inside the browser flow
+    // that already survives autoplay restrictions after one user gesture.
+    await speakStreamingText(previewText, { interruptCurrent: true });
   }
 
   async function uploadRecordedAudio(blob: Blob) {
@@ -1245,8 +1271,16 @@ export default function HomePage() {
 
       setRequest(transcript);
       appendLog(`[transcript] ${transcript}`);
-      appendLog("[audio] sending transcript directly to /run");
-      setAssistantStatus("Transcript captured. Sending it to the pipeline...");
+      appendLog(
+        awaitingClarification
+          ? "[audio] sending clarification transcript directly to /run"
+          : "[audio] sending transcript directly to /run",
+      );
+      setAssistantStatus(
+        awaitingClarification
+          ? "Clarification captured. Sending it back to the pipeline..."
+          : "Transcript captured. Sending it to the pipeline...",
+      );
       await runPipelineRequest(transcript);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -1354,11 +1388,13 @@ export default function HomePage() {
     stopMicrophoneStream();
     setWarmingUp(true);
     setWarmedUp(false);
+    setAwaitingClarification(false);
+    setPendingClarificationQuestion("");
     setLog("");
     setRequest("");
     setFinalResponse("");
     replaceAudioUrl("");
-    setAssistantStatus("Playing the welcome message...");
+    setAssistantStatus("Starting session and playing the welcome message...");
     appendLog(`POST ${backendBaseUrl}/session/warmup`);
 
     try {
@@ -1404,6 +1440,8 @@ export default function HomePage() {
     stopMicrophoneStream();
     setConversationId(createConversationId());
     setCanContinueSession(false);
+    setAwaitingClarification(false);
+    setPendingClarificationQuestion("");
     setChatTurns([]);
     setLog("");
     setFinalResponse("");
@@ -1412,13 +1450,14 @@ export default function HomePage() {
     setAssistantStatus(
       warmedUp
         ? "Started a new conversation. Send a fresh request when ready."
-        : "Press Run pipeline to hear the greeting and unlock the hosted audio flow.",
+        : "Press Start session to begin. The hosted controls stay idle until the welcome audio runs.",
     );
   }
 
   async function runPipelineRequest(userRequest: string) {
     const trimmedRequest = userRequest.trim();
     const continuingThisTurn = canContinueSession;
+    const answeringClarification = awaitingClarification;
 
     if (!backendBaseUrl) {
       appendLog(
@@ -1427,7 +1466,7 @@ export default function HomePage() {
       return;
     }
     if (!warmedUp) {
-      setAssistantStatus("Run the warmup greeting first.");
+      setAssistantStatus("Press Start session to begin.");
       return;
     }
     if (trimmedRequest.length === 0) {
@@ -1448,9 +1487,11 @@ export default function HomePage() {
     setFinalResponse("");
     replaceAudioUrl("");
     setAssistantStatus(
-      continuingThisTurn
-        ? "Continuing the active agentic conversation..."
-        : "Pipeline running...",
+      answeringClarification
+        ? "Sending the clarification answer back to the pipeline..."
+        : continuingThisTurn
+          ? "Continuing the active conversation..."
+          : "Pipeline running...",
     );
     if (!continuingThisTurn) {
       setLog("");
@@ -1498,6 +1539,7 @@ export default function HomePage() {
 
           if (ev.event === "busy") {
             setCanContinueSession(continuingThisTurn);
+            setAwaitingClarification(answeringClarification);
             setAssistantStatus(
               extractMessage(ev.data) || "The backend is busy. Try again shortly.",
             );
@@ -1506,6 +1548,7 @@ export default function HomePage() {
 
           if (ev.event === "error") {
             setCanContinueSession(continuingThisTurn);
+            setAwaitingClarification(answeringClarification);
             setAssistantStatus(
               extractMessage(ev.data) || "The pipeline returned an error.",
             );
@@ -1523,8 +1566,26 @@ export default function HomePage() {
           if (ev.event === "narration") {
             const narrationText = extractNarrationText(ev.data);
             if (narrationText) {
+              appendChatTurn({ role: "narrator", text: narrationText });
               queueSpeechText(narrationText);
             }
+            continue;
+          }
+
+          if (ev.event === "clarification_required") {
+            const question = extractClarificationQuestion(ev.data);
+            setAwaitingClarification(true);
+            setPendingClarificationQuestion(question);
+            setCanContinueSession(true);
+            if (question) {
+              appendChatTurn({ role: "narrator", text: question });
+              queueSpeechText(question);
+            }
+            setAssistantStatus(
+              question
+                ? "Clarification needed. Reply by text or voice to continue the same session."
+                : "Clarification needed. Reply to continue the same session.",
+            );
             continue;
           }
 
@@ -1533,6 +1594,8 @@ export default function HomePage() {
             const taskType = extractTaskType(ev.data);
             const resumableAgenticConversation =
               taskType === "agentic_retrieve_and_analyze";
+            setAwaitingClarification(false);
+            setPendingClarificationQuestion("");
             setCanContinueSession(resumableAgenticConversation);
             setFinalResponse(responseText);
             // Surface any charts the pipeline produced during this run.
@@ -1577,6 +1640,8 @@ export default function HomePage() {
     warmingUp || recording || transcribing || !backendBaseUrl || ttsOptionsLoading;
   const statusState = recording
     ? "recording"
+    : awaitingClarification
+      ? "ready"
     : running
       ? "running"
       : warmedUp
@@ -1584,6 +1649,8 @@ export default function HomePage() {
         : "idle";
   const currentPhase = recording
     ? "Recording"
+    : awaitingClarification
+      ? "Awaiting reply"
     : transcribing
       ? "Transcribing"
       : running
@@ -1595,7 +1662,11 @@ export default function HomePage() {
             : "Idle";
   const backendStateLabel = backendBaseUrl ? "Connected" : "Missing";
   const audioStateLabel = speaking ? "Speaking" : audioUrl ? "Audio ready" : "Silent";
-  const sessionModeLabel = canContinueSession ? "Follow-up mode" : "New request mode";
+  const sessionModeLabel = awaitingClarification
+    ? "Clarification pending"
+    : canContinueSession
+      ? "Follow-up mode"
+      : "New request mode";
 
   return (
     <main className="page-shell">
@@ -1639,6 +1710,11 @@ export default function HomePage() {
           <div className="status-box" data-state={statusState}>
             <p className="status-label">{currentPhase}</p>
             <p className="status-message">{assistantStatus}</p>
+            {awaitingClarification && pendingClarificationQuestion ? (
+              <p className="status-note">
+                Waiting on your answer: {pendingClarificationQuestion}
+              </p>
+            ) : null}
           </div>
 
           <div className="metric-grid">
@@ -1691,7 +1767,7 @@ export default function HomePage() {
               <div className="conversation-empty">
                 <p>No transcript yet.</p>
                 <span>
-                  Warm up the pipeline, then type or record a request to start
+                  Press Start session, then type or record a request to begin
                   the analysis.
                 </span>
               </div>
@@ -1703,9 +1779,11 @@ export default function HomePage() {
                     className="conversation-turn"
                     data-role={turn.role}
                   >
-                    <p className="conversation-role">
-                      {turn.role === "user" ? "You" : "Assistant"}
-                    </p>
+                    {turn.role === "user" ? null : (
+                      <p className="conversation-role">
+                        {turn.role === "assistant" ? "NHTSA AI Agent" : "Narrator"}
+                      </p>
+                    )}
                     <p className="conversation-text">{turn.text}</p>
                   </article>
                 ))}
@@ -1894,7 +1972,7 @@ export default function HomePage() {
               onClick={handleWarmup}
               disabled={controlsDisabled || speaking}
             >
-              {warmingUp ? "Warming up..." : "Run pipeline"}
+              {warmingUp ? "Starting..." : "Start session"}
             </button>
             <button
               type="button"
@@ -1942,6 +2020,11 @@ export default function HomePage() {
               New conversation
             </button>
           </div>
+
+          <p className="controls-note">
+            Press Start session first. The hosted voice flow does not begin until the
+            welcome audio has unlocked the browser playback path.
+          </p>
 
           {audioUrl ? (
             <audio

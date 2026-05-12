@@ -313,19 +313,16 @@ def _stream_openai_speech_pcm(
     voice_preset: str,
 ) -> Iterator[bytes]:
     """
-    Best-effort streamed OpenAI speech path for the hosted backend.
+    Stream OpenAI speech as raw PCM chunks for the hosted backend.
 
-    This is an informed implementation guess based on the official speech docs:
-    request raw PCM audio from `/v1/audio/speech`, ask for streamed audio
-    delivery, and treat the returned body as incremental mono PCM chunks.
+    The hosted route explicitly requests `response_format="pcm"` and
+    `stream_format="audio"` from `/v1/audio/speech`, then forwards the
+    incremental response body to the browser unchanged.
 
     Assumed contract for the frontend:
     * codec       -> pcm16
     * sample_rate -> 24000
     * channels    -> 1
-
-    If OpenAI's live wire contract differs in practice, this path can be
-    adjusted without changing the higher-level provider-selection design.
     """
     response = requests.post(
         _OPENAI_TTS_URL,

@@ -285,6 +285,14 @@ h2 {
   line-height: 1.45;
 }
 
+.status-note {
+  margin: 10px 0 0;
+  color: var(--navy);
+  font-size: 0.88rem;
+  line-height: 1.45;
+  font-weight: 700;
+}
+
 .metric-grid {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -404,6 +412,12 @@ h2 {
   background: #f2f7f9;
 }
 
+.conversation-turn[data-role="narrator"] {
+  justify-self: start;
+  border-color: rgba(125, 89, 39, 0.16);
+  background: #faf4ea;
+}
+
 .conversation-role {
   margin: 0;
   color: var(--quiet-ink);
@@ -413,12 +427,23 @@ h2 {
   text-transform: uppercase;
 }
 
+.conversation-turn[data-role="narrator"] .conversation-role {
+  color: #8a5c21;
+}
+
 .conversation-text {
   margin: 7px 0 0;
   color: var(--ink);
   font-size: 0.96rem;
   line-height: 1.55;
   white-space: pre-wrap;
+}
+
+.controls-note {
+  margin: 10px 0 0;
+  color: var(--muted-ink);
+  font-size: 0.88rem;
+  line-height: 1.45;
 }
 
 .composer-label {
