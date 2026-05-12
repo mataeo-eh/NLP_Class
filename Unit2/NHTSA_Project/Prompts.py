@@ -837,6 +837,7 @@ def build_schema_summary() -> str:
 # Retrieval prompt — drives the retrieve_data node's agentic mini-loop
 # ---------------------------------------------------------------------------
 
+
 def Retrieve_Data_Prompt(user_request: str, schema_str: str) -> dict:
     # This prompt is the system context for the retrieve_data node in the LangGraph
     # pipeline. The node runs a bounded agentic loop (up to 8 iterations) where the
@@ -932,3 +933,200 @@ message you produce without a tool call.
 '''
 
     return {"system": system_prompt, "user": user_prompt}
+
+
+# ---------------------------------------------------------------------------
+# Pre-built demo prompts — one per LangGraph route (plus follow-ups for the
+# two agentic pathways)
+# ---------------------------------------------------------------------------
+# These prompts are hand-crafted to reliably steer the pipeline down each
+# available route. They serve two purposes:
+#
+#   Templates  — load one into the text field, edit if needed, and send with
+#                confidence it will activate the intended pipeline path.
+#
+#   Demos      — run as-is to see how that route behaves end-to-end.
+#
+# LangGraph route map:
+#   "retrieve"                      → classify_task → retrieve_data → END
+#   "analyze"                       → classify_task → retrieve_data → analyze
+#                                     → confirm_csv_write → END
+#   "agentic_retrieve_and_analyze"  → classify_task → classify_agentic_subtype
+#     sub "agentic_analyze"           → agentic_analyze → END
+#     sub "agentic_explore"           → agentic_explore → END
+#
+# Follow-up prompts (is_followup=True) are meant to be sent as a SECOND TURN
+# inside the same active agentic session (after the matching initial prompt
+# completes and the frontend shows "Continuing session" mode). They demonstrate
+# the back-and-forth interactability of the agentic pathways.
+#
+# Each entry is a plain dict so the FastAPI backend can serialise it directly
+# to JSON via Pydantic without any extra conversion step.
+# ---------------------------------------------------------------------------
+
+DEMO_PROMPTS: list[dict] = [
+    # ------------------------------------------------------------------
+    # Route 1 — retrieve
+    # Path: classify_task → retrieve_data → END
+    # No analysis runs. The model fetches rows and returns them verbatim.
+    # ------------------------------------------------------------------
+    {
+        "id": "retrieve_brake_complaints",
+        "route": "retrieve",
+        "route_label": "Retrieve",
+        "label": "Browse Brake Failure Complaints",
+        "description": (
+            "Pure data retrieval — no analysis. Fetches 5 recent brake-failure "
+            "complaints and returns the complaint text, make, model, year, and "
+            "injury count. Exercises the classify_task → retrieve_data → END path."
+        ),
+        "prompt_text": (
+            "Show me 5 recent NHTSA complaints about brake failures. "
+            "For each one, return the complaint ID, make, model, model year, "
+            "number of injuries, and the full complaint description text."
+        ),
+        "is_followup": False,
+        "followup_for": None,
+    },
+
+    # ------------------------------------------------------------------
+    # Route 2 — analyze
+    # Path: classify_task → retrieve_data → analyze → confirm_csv_write → END
+    # retrieve_data fetches the rows first; analyze applies a fixed per-row
+    # analysis prompt (Safety_Prompt or Specific_Subsystem_Prompt) chosen by
+    # gpt-5.1; confirm_csv_write asks whether to persist results to disk.
+    # ------------------------------------------------------------------
+    {
+        "id": "analyze_safety_airbag",
+        "route": "analyze",
+        "route_label": "Analyze",
+        "label": "Safety Evaluation — Airbag Malfunction Complaints",
+        "description": (
+            "Retrieve-then-analyze pipeline. Fetches 3 recent airbag complaints "
+            "and runs a structured safety evaluation on each: danger level, urgency "
+            "for human review, safety category, and full reasoning. "
+            "Exercises the classify_task → retrieve_data → analyze → confirm_csv_write path."
+        ),
+        "prompt_text": (
+            "Retrieve 3 recent airbag malfunction complaints and perform a safety "
+            "evaluation on each one. For each complaint, assess the danger level "
+            "(None / Low / Mild / Moderate / High / Severe), urgency for human review "
+            "(Low / Urgent / Emergent), assign a safety category, and provide thorough reasoning."
+        ),
+        "is_followup": False,
+        "followup_for": None,
+    },
+
+    # ------------------------------------------------------------------
+    # Route 3a — agentic_analyze (initial turn)
+    # Path: classify_task → classify_agentic_subtype → agentic_analyze → END
+    # The agent retrieves targeted rows, optionally pulls supporting columns,
+    # and emits a final structured JSON verdict delivered via TTS.
+    # ------------------------------------------------------------------
+    {
+        "id": "agentic_analyze_toyota_brakes",
+        "route": "agentic_analyze",
+        "route_label": "Agentic Analyze",
+        "label": "Deep-Dive Toyota Brake Complaints — Danger Rating (Initial)",
+        "description": (
+            "Initial turn of an agentic analysis session. The agent retrieves the "
+            "5 most recent Toyota brake complaints, pulls injury and death counts as "
+            "supporting evidence, and rates the danger level of each complaint with "
+            "specific, evidence-backed reasoning. "
+            "Exercises classify_task → classify_agentic_subtype → agentic_analyze."
+        ),
+        "prompt_text": (
+            "Retrieve the 5 most recent Toyota brake-related complaints from 2022 onwards. "
+            "For each complaint, pull the injury count and death count from the database as "
+            "supporting evidence, then rate the danger level (Low / Moderate / High / Severe) "
+            "with a specific justification grounded in both the complaint text and the injury data."
+        ),
+        "is_followup": False,
+        "followup_for": None,
+    },
+
+    # ------------------------------------------------------------------
+    # Route 3b — agentic_analyze (follow-up turn)
+    # Send AFTER "agentic_analyze_toyota_brakes" completes in the same session.
+    # Demonstrates the back-and-forth of the agentic_analyze path by asking
+    # the agent to revisit its verdicts in light of population-level data.
+    # ------------------------------------------------------------------
+    {
+        "id": "agentic_analyze_toyota_brakes_followup",
+        "route": "agentic_analyze",
+        "route_label": "Agentic Analyze",
+        "label": "Cross-Reference Population Data — Revise Ratings (Follow-up)",
+        "description": (
+            "Second turn — send this after the Toyota brake analysis completes "
+            "and the session is in 'Continuing session' mode. Asks the agent to "
+            "compare its per-complaint danger ratings against the full population "
+            "of Toyota brake complaints and revise any ratings the broader data "
+            "warrants changing. Demonstrates agentic back-and-forth reasoning."
+        ),
+        "prompt_text": (
+            "Now compare those Toyota brake complaint danger ratings against the broader "
+            "picture: how many Toyota brake complaints exist in the full database, and "
+            "what is the average injury count across all of them? If the population-level "
+            "data suggests these complaints are unusually severe or unusually mild relative "
+            "to the norm, revise your danger ratings and explain exactly what changed and why."
+        ),
+        "is_followup": True,
+        "followup_for": "agentic_analyze_toyota_brakes",
+    },
+
+    # ------------------------------------------------------------------
+    # Route 4a — agentic_explore (initial turn)
+    # Path: classify_task → classify_agentic_subtype → agentic_explore → END
+    # The agent browses data conversationally, renders charts on request,
+    # and narrates findings via TTS (user cannot see chart images directly).
+    # ------------------------------------------------------------------
+    {
+        "id": "agentic_explore_top_makes_chart",
+        "route": "agentic_explore",
+        "route_label": "Agentic Explore",
+        "label": "Chart: Top 10 Makes by Complaint Volume (Initial)",
+        "description": (
+            "Initial turn of an agentic exploration session. The agent renders a "
+            "bar chart of the top 10 vehicle makes by total complaint count, then "
+            "narrates the distribution — which make dominates, by how much, and any "
+            "surprising entries. Exercises classify_task → classify_agentic_subtype "
+            "→ agentic_explore with chart generation and spoken narration."
+        ),
+        "prompt_text": (
+            "Show me a bar chart of the top 10 vehicle makes with the most NHTSA "
+            "complaints in the database. After rendering the chart, narrate what you "
+            "see: which make has the most complaints, how large is the gap between "
+            "first and second place, and are there any surprising entries in the top 10?"
+        ),
+        "is_followup": False,
+        "followup_for": None,
+    },
+
+    # ------------------------------------------------------------------
+    # Route 4b — agentic_explore (follow-up turn)
+    # Send AFTER "agentic_explore_top_makes_chart" completes in the same session.
+    # Demonstrates multi-turn conversational chart exploration by drilling into
+    # the leading make from the first chart.
+    # ------------------------------------------------------------------
+    {
+        "id": "agentic_explore_top_makes_followup",
+        "route": "agentic_explore",
+        "route_label": "Agentic Explore",
+        "label": "Drill Into Top Make — Subsystem Breakdown Chart (Follow-up)",
+        "description": (
+            "Second turn — send this after the top-makes chart completes and the "
+            "session is in 'Continuing session' mode. Asks the agent to zoom into "
+            "the #1 make and render a second chart showing its complaints broken down "
+            "by subsystem component. Demonstrates chained chart generation and "
+            "multi-turn conversational data exploration."
+        ),
+        "prompt_text": (
+            "Now zoom into the vehicle make with the most complaints from that chart. "
+            "Break down its complaints by subsystem component — which vehicle systems "
+            "are failing most often for that brand? Show me a subsystem frequency bar "
+            "chart and walk me through the top 5 failure categories."
+        ),
+        "is_followup": True,
+        "followup_for": "agentic_explore_top_makes_chart",
+    },
+]

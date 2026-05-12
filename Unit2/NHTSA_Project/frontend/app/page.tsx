@@ -49,6 +49,17 @@ type TtsOptionsResponse = {
   providers: TtsProviderOption[];
 };
 
+type PromptTemplate = {
+  id: string;
+  route: string;
+  route_label: string;
+  label: string;
+  description: string;
+  prompt_text: string;
+  is_followup: boolean;
+  followup_for: string | null;
+};
+
 type WindowWithWebkitAudioContext = Window &
   typeof globalThis & {
     webkitAudioContext?: typeof AudioContext;
@@ -279,6 +290,8 @@ function parseTtsOptionsResponse(payload: unknown): TtsOptionsResponse | null {
 
 export default function HomePage() {
   const [request, setRequest] = useState("");
+  const [demoPrompts, setDemoPrompts] = useState<PromptTemplate[]>([]);
+  const [promptPanelOpen, setPromptPanelOpen] = useState(false);
   const [conversationId, setConversationId] = useState(() => createConversationId());
   const [canContinueSession, setCanContinueSession] = useState(false);
   const [chatTurns, setChatTurns] = useState<ChatTurn[]>([]);
@@ -356,6 +369,25 @@ export default function HomePage() {
       voice_preset: activeSelection.voicePreset,
     };
   }
+
+  useEffect(() => {
+    if (!backendBaseUrl) return;
+    let cancelled = false;
+    async function loadPrompts() {
+      try {
+        const response = await fetch(`${backendBaseUrl}/prompts`);
+        if (!response.ok || cancelled) return;
+        const data = (await response.json()) as unknown;
+        if (!cancelled && Array.isArray(data)) {
+          setDemoPrompts(data as PromptTemplate[]);
+        }
+      } catch {
+        // prompts are non-critical; silently ignore fetch errors
+      }
+    }
+    void loadPrompts();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (!backendBaseUrl) {
@@ -1414,6 +1446,72 @@ export default function HomePage() {
               </div>
             )}
           </div>
+
+          {demoPrompts.length > 0 ? (
+            <section className="voice-settings-panel" aria-label="Demo prompt templates">
+              <div className="panel-heading compact">
+                <div>
+                  <p className="section-kicker">Templates</p>
+                  <h2>Demo prompts</h2>
+                </div>
+                <button
+                  type="button"
+                  className="button button-ghost button-inline"
+                  onClick={() => setPromptPanelOpen((prev) => !prev)}
+                >
+                  {promptPanelOpen ? "Hide templates" : "Choose template"}
+                </button>
+              </div>
+
+              {promptPanelOpen ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: "10px", marginTop: "8px" }}>
+                  {demoPrompts.map((pt) => (
+                    <article
+                      key={pt.id}
+                      style={{
+                        padding: "12px 14px",
+                        border: "1px solid rgba(16,24,32,0.12)",
+                        borderRadius: "var(--radius)",
+                        background: "var(--panel-tint)",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px", marginBottom: "4px", flexWrap: "wrap" }}>
+                        <span
+                          className="mode-badge"
+                          style={{ fontSize: "0.74rem", minHeight: "24px", padding: "0 8px" }}
+                        >
+                          {pt.route_label}
+                        </span>
+                        {pt.is_followup ? (
+                          <span
+                            className="mode-badge"
+                            style={{ fontSize: "0.74rem", minHeight: "24px", padding: "0 8px", background: "rgba(198,122,22,0.12)", color: "var(--amber)" }}
+                          >
+                            Follow-up
+                          </span>
+                        ) : null}
+                        <strong style={{ fontSize: "0.92rem", color: "var(--navy)" }}>{pt.label}</strong>
+                      </div>
+                      <p style={{ margin: "0 0 10px", fontSize: "0.85rem", color: "var(--muted-ink)", lineHeight: 1.45 }}>
+                        {pt.description}
+                      </p>
+                      <button
+                        type="button"
+                        className="button button-secondary"
+                        style={{ fontSize: "0.82rem", padding: "6px 14px" }}
+                        onClick={() => {
+                          setRequest(pt.prompt_text);
+                          setPromptPanelOpen(false);
+                        }}
+                      >
+                        Load prompt
+                      </button>
+                    </article>
+                  ))}
+                </div>
+              ) : null}
+            </section>
+          ) : null}
 
           <label className="composer-label" htmlFor="request-input">
             Message

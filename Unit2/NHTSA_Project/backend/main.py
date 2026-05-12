@@ -55,6 +55,10 @@ from pydantic import BaseModel, Field
 # missing dependency, malformed graph) shows up immediately in the uvicorn
 # logs rather than the first time a user hits /run.
 from pipeline_runner import WELCOME_TTS_TEXT, encode_sse, stream_pipeline
+# DEMO_PROMPTS is a module-level constant in Prompts.py. pipeline_runner has
+# already inserted PROJECT_ROOT into sys.path at import time above, so this
+# bare import resolves to NHTSA_Project/Prompts.py without further path setup.
+from Prompts import DEMO_PROMPTS
 from LLM_Tools.MCP_To_Tools import (
     build_default_mcp_tool_manager,
     set_global_mcp_tool_manager,
@@ -350,6 +354,50 @@ class WarmupResponse(BaseModel):
         description="Short UI status message to show when the browser can capture or send input.",
     )
 
+
+class PromptTemplate(BaseModel):
+    """
+    One pre-built demo prompt entry from DEMO_PROMPTS in Prompts.py.
+
+    Each entry targets a specific LangGraph route and can be loaded directly
+    into the frontend's message field as a starting template. Follow-up entries
+    (is_followup=True) are designed to be sent as a second turn within an
+    active agentic session to demonstrate the pipeline's back-and-forth.
+    """
+
+    id: str = Field(..., description="Stable identifier for this prompt template.")
+    route: str = Field(
+        ...,
+        description=(
+            "Internal LangGraph route this prompt is designed to exercise "
+            "(retrieve / analyze / agentic_analyze / agentic_explore)."
+        ),
+    )
+    route_label: str = Field(
+        ...,
+        description="Short display label for the route badge shown in the frontend UI.",
+    )
+    label: str = Field(..., description="Human-readable title for this prompt template.")
+    description: str = Field(
+        ...,
+        description="One or two sentences explaining what this prompt does and which path it exercises.",
+    )
+    prompt_text: str = Field(
+        ...,
+        description="The actual prompt text to load into the message input field.",
+    )
+    is_followup: bool = Field(
+        default=False,
+        description=(
+            "True when this prompt is intended as a second turn in an existing "
+            "agentic session rather than as a fresh pipeline start."
+        ),
+    )
+    followup_for: str | None = Field(
+        default=None,
+        description="ID of the initial prompt this follow-up is paired with, or null.",
+    )
+
 # ---------------------------------------------------------------------------
 # Routes.
 # ---------------------------------------------------------------------------
@@ -364,8 +412,8 @@ async def read_root() -> dict[str, str]:
         "status": "ok",
         "version": app.version,
         "endpoints": (
-            "GET /health, POST /session/warmup, GET /audio/tts/options, POST /run, "
-            "POST /audio/transcribe, POST /audio/speech, POST /audio/speech/stream"
+            "GET /health, GET /prompts, POST /session/warmup, GET /audio/tts/options, "
+            "POST /run, POST /audio/transcribe, POST /audio/speech, POST /audio/speech/stream"
         ),
     }
 
@@ -406,6 +454,21 @@ async def warmup_session() -> WarmupResponse:
         welcome_text=WELCOME_TTS_TEXT,
         ready_prompt="Speak now.",
     )
+
+
+@app.get("/prompts", response_model=list[PromptTemplate])
+async def list_prompts() -> list[PromptTemplate]:
+    """
+    Return the pre-built demo prompt templates from Prompts.DEMO_PROMPTS.
+
+    Each entry targets one LangGraph route and can be loaded directly into the
+    frontend's message field. The frontend uses this list to populate the
+    templates panel so users can pick a starting prompt, edit it if desired,
+    and send it with confidence it will steer the pipeline down the intended
+    route. Follow-up entries (is_followup=True) are meant to be sent as a
+    second turn inside an active agentic session.
+    """
+    return [PromptTemplate.model_validate(entry) for entry in DEMO_PROMPTS]
 
 
 @app.get("/audio/tts/options", response_model=TtsOptionsResponse)
