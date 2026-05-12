@@ -675,9 +675,16 @@ async def stream_speech(req: SpeechRequest) -> StreamingResponse:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
         def generate_pcm_chunks():
+            # A browser-side "stop narration" action aborts the HTTP request.
+            # When that happens, explicitly close the provider iterator if it
+            # exposes a close() hook so requests/SDK streams are released
+            # immediately instead of waiting for garbage collection.
+            close_pcm_chunks = getattr(pcm_chunks, "close", None)
             try:
                 yield from pcm_chunks
             finally:
+                if callable(close_pcm_chunks):
+                    close_pcm_chunks()
                 _AUDIO_SLOTS.release()
 
         return StreamingResponse(

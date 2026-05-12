@@ -75,6 +75,16 @@ type WindowWithWebkitAudioContext = Window &
     webkitAudioContext?: typeof AudioContext;
   };
 
+type ActiveNarrationPlayback = {
+  controller: AbortController | null;
+  cleanup: (() => void) | null;
+  audioElement: HTMLAudioElement | null;
+  sources: Set<AudioBufferSourceNode>;
+  resolveFinished: (() => void) | null;
+  scheduleComplete: boolean;
+  settled: boolean;
+};
+
 // ---------------------------------------------------------------------------
 // Chart panel types and component
 // ---------------------------------------------------------------------------
@@ -546,6 +556,7 @@ export default function HomePage() {
   const [recording, setRecording] = useState(false);
   const [transcribing, setTranscribing] = useState(false);
   const [speaking, setSpeaking] = useState(false);
+  const [narrationPaused, setNarrationPaused] = useState(false);
   const [assistantStatus, setAssistantStatus] = useState(
     "Press Start session to begin. The hosted controls stay idle until the welcome audio runs.",
   );
@@ -567,6 +578,7 @@ export default function HomePage() {
   const recordedChunksRef = useRef<Blob[]>([]);
   const speechQueueRef = useRef<string[]>([]);
   const drainingSpeechQueueRef = useRef(false);
+  const activeNarrationPlaybackRef = useRef<ActiveNarrationPlayback | null>(null);
   const ttsSelectionRef = useRef({
     ttsProvider: "deepgram",
     voicePreset: "aura-2-hyperion-en",
@@ -780,15 +792,54 @@ export default function HomePage() {
     setAudioUrl(nextUrl);
   }
 
-  function stopScheduledPlayback() {
-    for (const source of activeSourcesRef.current) {
+  function createNarrationPlayback(
+    controller: AbortController | null,
+  ): { playback: ActiveNarrationPlayback; finished: Promise<void> } {
+    let resolveFinished = () => {};
+    const finished = new Promise<void>((resolve) => {
+      resolveFinished = resolve;
+    });
+    const playback: ActiveNarrationPlayback = {
+      controller,
+      cleanup: null,
+      audioElement: null,
+      sources: new Set(),
+      resolveFinished,
+      scheduleComplete: false,
+      settled: false,
+    };
+    activeNarrationPlaybackRef.current = playback;
+    setSpeaking(true);
+    setNarrationPaused(false);
+    return { playback, finished };
+  }
+
+  function settleNarrationPlayback(playback: ActiveNarrationPlayback) {
+    if (playback.settled) {
+      return;
+    }
+    playback.settled = true;
+    playback.cleanup?.();
+    playback.cleanup = null;
+    if (activeNarrationPlaybackRef.current === playback) {
+      activeNarrationPlaybackRef.current = null;
+    }
+    setNarrationPaused(false);
+    playback.resolveFinished?.();
+    playback.resolveFinished = null;
+  }
+
+  function stopScheduledPlayback(playback?: ActiveNarrationPlayback | null) {
+    const sources = playback?.sources ?? activeSourcesRef.current;
+    for (const source of sources) {
       try {
         source.stop();
       } catch {
         // AudioBufferSourceNode.stop() throws if the source already ended.
       }
+      activeSourcesRef.current.delete(source);
     }
-    activeSourcesRef.current.clear();
+    sources.clear();
     const audioContext = audioContextRef.current;
     playbackCursorRef.current = audioContext ? audioContext.currentTime : 0;
   }
@@ -804,11 +855,22 @@ export default function HomePage() {
 
   function interruptSpeechPlayback() {
     speechQueueRef.current = [];
+    const playback = activeNarrationPlaybackRef.current;
+    playback?.controller?.abort();
     speechAbortRef.current?.abort();
-    stopScheduledPlayback();
+    stopScheduledPlayback(playback);
+    if (playback?.audioElement) {
+      playback.audioElement.pause();
+      playback.audioElement.currentTime = 0;
+    }
     if (audioElementRef.current) {
       audioElementRef.current.pause();
       audioElementRef.current.currentTime = 0;
+    }
+    if (playback) {
+      settleNarrationPlayback(playback);
+    } else {
+      setNarrationPaused(false);
     }
   }
 
@@ -865,6 +927,7 @@ export default function HomePage() {
     pcmBytes: Uint8Array,
     codec: string,
     sampleRate: number,
+    playback: ActiveNarrationPlayback,
   ) {
     const audioBuffer = pcmChunkToAudioBuffer(
       audioContext,
@@ -882,8 +945,13 @@ export default function HomePage() {
     );
     source.addEventListener("ended", () => {
       activeSourcesRef.current.delete(source);
+      playback.sources.delete(source);
+      if (playback.scheduleComplete && playback.sources.size === 0) {
+        settleNarrationPlayback(playback);
+      }
     });
     activeSourcesRef.current.add(source);
+    playback.sources.add(source);
     source.start(startAt);
     playbackCursorRef.current = startAt + audioBuffer.duration;
   }
@@ -989,7 +1057,7 @@ export default function HomePage() {
     appendLog(
       `POST ${backendBaseUrl}/audio/speech (${activeSelection.ttsProvider}:${activeSelection.voicePreset})`,
     );
-    setSpeaking(true);
+    const { playback, finished } = createNarrationPlayback(null);
     try {
       const response = await fetch(`${backendBaseUrl}/audio/speech`, {
         method: "POST",
@@ -1007,6 +1075,20 @@ export default function HomePage() {
       replaceAudioUrl(nextUrl);
 
       const audio = audioElementRef.current ?? new Audio(nextUrl);
+      playback.audioElement = audio;
+      playback.cleanup = () => {
+        audio.removeEventListener("ended", handleEnded);
+        audio.removeEventListener("error", handleError);
+      };
+      function handleEnded() {
+        settleNarrationPlayback(playback);
+      }
+      function handleError() {
+        settleNarrationPlayback(playback);
+      }
+      audio.addEventListener("ended", handleEnded);
+      audio.addEventListener("error", handleError);
+      playback.scheduleComplete = true;
       try {
         await audio.play();
       } catch {
@@ -1014,7 +1096,9 @@ export default function HomePage() {
         setAssistantStatus(
           "Browser autoplay was blocked. Use the audio controls below to play the response.",
         );
+        settleNarrationPlayback(playback);
       }
+      await finished;
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
         appendLog("[audio] stream cancelled");
@@ -1023,6 +1107,7 @@ export default function HomePage() {
         appendLog(`audio failed: ${message}`);
       }
     } finally {
+      settleNarrationPlayback(playback);
       setSpeaking(false);
     }
   }
@@ -1062,7 +1147,7 @@ export default function HomePage() {
 
     const controller = new AbortController();
     speechAbortRef.current = controller;
-    setSpeaking(true);
+    const { playback, finished } = createNarrationPlayback(controller);
 
     try {
       appendLog(
@@ -1128,7 +1213,7 @@ export default function HomePage() {
         if (combined.byteLength === 0) continue;
 
         pcmChunks.push(combined);
-        schedulePcmChunk(audioContext, combined, codec, sampleRate);
+        schedulePcmChunk(audioContext, combined, codec, sampleRate, playback);
       }
 
       if (carry.byteLength > 0) {
@@ -1146,6 +1231,11 @@ export default function HomePage() {
         buildWaveBlobFromPcmChunks(pcmChunks, codec, sampleRate),
       );
       replaceAudioUrl(nextUrl);
+      playback.scheduleComplete = true;
+      if (playback.sources.size === 0) {
+        settleNarrationPlayback(playback);
+      }
+      await finished;
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
         appendLog("[audio] stream cancelled");
@@ -1154,9 +1244,11 @@ export default function HomePage() {
         appendLog(`audio failed: ${message}`);
       }
     } finally {
+      playback.scheduleComplete = true;
       if (speechAbortRef.current === controller) {
         speechAbortRef.current = null;
       }
+      settleNarrationPlayback(playback);
       setSpeaking(false);
     }
   }
@@ -1182,6 +1274,63 @@ export default function HomePage() {
     if (!spokenText) return;
     speechQueueRef.current.push(spokenText);
     void drainSpeechQueue();
+  }
+
+  async function toggleNarrationPause() {
+    const playback = activeNarrationPlaybackRef.current;
+    if (!playback) {
+      return;
+    }
+
+    if (narrationPaused) {
+      if (playback.audioElement) {
+        try {
+          await playback.audioElement.play();
+        } catch {
+          appendLog("[audio] resume was blocked; use Replay audio or the native audio controls");
+          setAssistantStatus(
+            "Browser playback blocked the resume request. Use Replay audio or the native audio controls below.",
+          );
+          return;
+        }
+      }
+      const audioContext = audioContextRef.current;
+      if (audioContext && audioContext.state === "suspended") {
+        await audioContext.resume();
+      }
+      appendLog("[audio] narration resumed");
+      setNarrationPaused(false);
+      return;
+    }
+
+    if (playback.audioElement && !playback.audioElement.paused) {
+      playback.audioElement.pause();
+    }
+    const audioContext = audioContextRef.current;
+    if (audioContext && audioContext.state === "running") {
+      await audioContext.suspend();
+    }
+    appendLog("[audio] narration paused");
+    setNarrationPaused(true);
+  }
+
+  function stopNarrationPlayback() {
+    const playback = activeNarrationPlaybackRef.current;
+    if (!playback) {
+      return;
+    }
+    playback.controller?.abort();
+    if (speechAbortRef.current === playback.controller) {
+      speechAbortRef.current = null;
+    }
+    stopScheduledPlayback(playback);
+    if (playback.audioElement) {
+      playback.audioElement.pause();
+      playback.audioElement.currentTime = 0;
+    }
+    settleNarrationPlayback(playback);
+    setSpeaking(false);
+    appendLog("[audio] narration stopped");
   }
 
   async function replayAudio() {
@@ -1661,7 +1810,13 @@ export default function HomePage() {
             ? "Ready"
             : "Idle";
   const backendStateLabel = backendBaseUrl ? "Connected" : "Missing";
-  const audioStateLabel = speaking ? "Speaking" : audioUrl ? "Audio ready" : "Silent";
+  const audioStateLabel = narrationPaused
+    ? "Paused"
+    : speaking
+      ? "Speaking"
+      : audioUrl
+        ? "Audio ready"
+        : "Silent";
   const sessionModeLabel = awaitingClarification
     ? "Clarification pending"
     : canContinueSession
@@ -2010,6 +2165,24 @@ export default function HomePage() {
               disabled={warmingUp || running || speaking || !finalResponse || !backendBaseUrl}
             >
               {speaking ? "Speaking..." : "Replay audio"}
+            </button>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={() => {
+                void toggleNarrationPause();
+              }}
+              disabled={!speaking}
+            >
+              {narrationPaused ? "Resume narration" : "Pause narration"}
+            </button>
+            <button
+              type="button"
+              className="button button-secondary"
+              onClick={stopNarrationPlayback}
+              disabled={!speaking}
+            >
+              Stop narration
             </button>
             <button
               type="button"
