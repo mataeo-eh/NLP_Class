@@ -1019,11 +1019,8 @@ DEMO_PROMPTS: list[dict] = [
             "Exercises the classify_task → retrieve_data → analyze → confirm_csv_write path."
         ),
         "prompt_text": (
-            "Evaluate the 3 most recent airbag malfunction complaints for safety risk. "
-            "For each complaint, assign a danger level (None / Low / Mild / Moderate / High / Severe), "
-            "an urgency rating for human review (Low / Urgent / Emergent), a safety category, "
-            "and detailed reasoning that explains the assessment. "
-            "Apply the same structured safety evaluation to each of the 3 complaints."
+            "Evaluate the 3 most recent complaints, filtered by"
+            "the component 'airbag,' for airbag malfunction complaints for their safety risk. "
         ),
         "is_followup": False,
         "followup_for": None,
