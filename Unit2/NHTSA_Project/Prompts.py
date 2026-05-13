@@ -864,7 +864,8 @@ The loop exits as soon as you produce a response with no tool calls.
 ===============================================================================
 DATA SOURCE 1 — NHTSA Complaints Parquet Database (~90,000 rows)
 ===============================================================================
-Use get_rows_by_position, filter_rows, and get_recent_complaints to access this database.
+Use get_rows_by_position, list_nhtsa_component_categories, filter_rows, and
+get_recent_complaints to access this database.
 
 {schema_str}
 
@@ -904,6 +905,23 @@ HOW MANY RESULTS?
     clarifying question. The tool speaks the question, captures the reply, and
     returns the transcript — use that answer to decide how many rows to fetch.
 
+COMPONENT AND SUBSYSTEM REQUESTS — REQUIRED GROUNDING STEP
+  - If the user names a subsystem, component, or failure area (for example
+    airbags, brakes, infotainment, steering, seat belts, electrical system),
+    you must call list_nhtsa_component_categories() before fetching complaint
+    rows from the parquet database.
+  - Use that tool's returned component list to determine which official NHTSA
+    top-level component category best matches the user's wording.
+  - Then fetch rows by filtering on COMPDESC with that chosen category:
+    filters={{"COMPDESC": "<chosen category>"}}.
+  - If the user's wording is broader, informal, or does not exactly match the
+    taxonomy, choose the closest category that would reasonably contain the
+    user's requested issue before you fetch rows.
+  - Do not use an unfiltered get_rows_by_position() random sample when the user
+    has already named a component or subsystem.
+  - If more than one category looks genuinely plausible and the choice would
+    materially change the results, ask the user to clarify before fetching.
+
 WHICH FIELDS?
   - If the user names a specific field (e.g. "what was the complaint text",
     "show me the make and model"), return only those fields.
@@ -919,8 +937,14 @@ WHEN TO ASK VS. WHEN TO INFER
   Do not ask unnecessary clarifying questions — use your judgment.
 
 TOOL ARGUMENT RULES
+  - list_nhtsa_component_categories returns the valid top-level component names
+    you should use when filtering COMPDESC.
   - filter_rows requires an explicit filters object. If you truly want no
     filters, pass {{}} rather than omitting the argument.
+  - For component-specific complaint requests, prefer filter_rows with
+    filters={{"COMPDESC": "<chosen category>"}}. If the user asks for the
+    newest or latest complaints within that component, prefer
+    get_recent_complaints with the same COMPDESC filter.
   - get_recent_complaints also accepts filters. Use it for recency-based
     requests such as "most recent brake complaints" or "latest recalls by make".
 
@@ -931,6 +955,8 @@ When you have retrieved the data, produce a single final response that:
   1. Briefly describes what you retrieved and from which source.
   2. Presents the data clearly (you may format it as a readable list or table in text).
   3. Notes any capping, filtering, or clarification decisions you made.
+  4. If you mapped the user's wording to an NHTSA component category, explicitly
+     name the category you chose.
 
 Do not call any more tools in your final response — the loop exits on the first
 message you produce without a tool call.

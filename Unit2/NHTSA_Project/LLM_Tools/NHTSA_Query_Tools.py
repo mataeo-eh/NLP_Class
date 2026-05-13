@@ -12,6 +12,8 @@ Tool catalogue
 --------------
 Parquet tools:
   get_rows_by_position     — fetch rows by explicit positions or random sample
+  list_nhtsa_component_categories
+                           — list the top-level COMPDESC component categories available for filtering
   filter_rows              — fetch a small preview of matching complaint rows
   get_recent_complaints    — fetch the newest complaints matching filters
   count_complaints         — exact full-dataset row count after filtering
@@ -58,6 +60,7 @@ from Project_Tools.Runtime_Options import (
     is_headless_mode,
 )
 from LLM_Tools.MCP_To_Tools import register_stats_dataset
+from Prompts import NHTSA_COMPONENT_TAXONOMY
 
 # ---------------------------------------------------------------------------
 # File path constants
@@ -281,6 +284,34 @@ def _build_categorical_summary(series: pd.Series) -> dict:
 # ---------------------------------------------------------------------------
 # Parquet tools
 # ---------------------------------------------------------------------------
+
+@tool
+def list_nhtsa_component_categories() -> str:
+    """Return the available top-level NHTSA component categories for COMPDESC filtering.
+
+    Use this before fetching complaint rows when the user names a subsystem or
+    component. The returned component names are the exact top-level taxonomy
+    values you should use in filters={"COMPDESC": "<component>"}.
+
+    If the user's wording does not exactly match one category, choose the
+    closest category from this list before calling filter_rows or
+    get_recent_complaints. COMPDESC filtering checks whether that chosen
+    category appears anywhere in the complaint's component list.
+    """
+    return json.dumps(
+        {
+            "filter_column": "COMPDESC",
+            "count": len(NHTSA_COMPONENT_TAXONOMY),
+            "components": NHTSA_COMPONENT_TAXONOMY,
+            "usage_note": (
+                "Choose the closest category from this list, then pass it as "
+                'filters={"COMPDESC": "<CATEGORY>"} to filter_rows or '
+                "get_recent_complaints."
+            ),
+        },
+        indent=2,
+    )
+
 
 @tool
 def get_rows_by_position(

@@ -31,6 +31,7 @@ from Prompts import (
 from config import mercury_llm, gpt5_4_mini_llm, gpt5_1_llm
 from LLM_Tools.NHTSA_Query_Tools import (
     get_rows_by_position,
+    list_nhtsa_component_categories,
     filter_rows,
     get_recent_complaints,
     count_complaints,
@@ -583,6 +584,7 @@ def retrieve_data(state: State) -> dict:
     # prior analyze run in the same session.
     tool_list = [
         get_rows_by_position,
+        list_nhtsa_component_categories,
         filter_rows,
         get_recent_complaints,
         list_csv_files,
@@ -1140,6 +1142,7 @@ def agentic_analyze(state: State) -> dict:
     # because it returns structured data only; no charts or code execution.
     tool_list = [
         get_rows_by_position,
+        list_nhtsa_component_categories,
         filter_rows,
         count_complaints,
         group_complaints,
@@ -1375,6 +1378,7 @@ def agentic_explore(state: State) -> dict:
         read_file_section,
         voice_ask_user,
         get_rows_by_position,
+        list_nhtsa_component_categories,
         filter_rows,
         count_complaints,
         group_complaints,
