@@ -1045,7 +1045,7 @@ DEMO_PROMPTS: list[dict] = [
             "Exercises the classify_task → retrieve_data → analyze → confirm_csv_write path."
         ),
         "prompt_text": (
-            "Evaluate the 3 most recent complaints, filtered by"
+            "Evaluate the 3 most recent complaints, filtered by "
             "the component 'airbag,' for airbag malfunction complaints for their safety risk. "
         ),
         "is_followup": False,
